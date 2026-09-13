@@ -60,7 +60,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     /// Extra-high reasoning effort. Serializes as `"xhigh"`.
-    #[serde(rename = "xhigh")]
+    #[serde(rename = "xhigh", alias = "extra-high")]
     ExtraHigh,
     /// Maximum reasoning effort. Serializes as `"max"`.
     Max,
@@ -113,7 +113,7 @@ impl TryFrom<&str> for ReasoningEffort {
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
-            "xhigh" => Ok(Self::ExtraHigh),
+            "xhigh" | "extra-high" => Ok(Self::ExtraHigh),
             "max" => Ok(Self::Max),
             other => Err(format!("unknown reasoning effort: {other}")),
         }

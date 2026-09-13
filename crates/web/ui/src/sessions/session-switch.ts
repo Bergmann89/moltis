@@ -105,8 +105,8 @@ export function restoreSessionState(entry: SessionMeta, projectId?: string): voi
 	S.setActiveProjectId(effectiveProjectId);
 	localStorage.setItem("moltis-project", effectiveProjectId);
 	updateSessionProjectSelect(effectiveProjectId);
+	const baseModelId = restoreReasoningFromModelId(entry.model || "");
 	if (entry.model) {
-		const baseModelId = restoreReasoningFromModelId(entry.model);
 		modelStore.select(baseModelId);
 		S.setSelectedModelId(baseModelId);
 		localStorage.setItem("moltis-model", baseModelId);
@@ -147,6 +147,7 @@ export function startSessionRefresh(key: string, blockRealtimeEvents: boolean): 
 	sessionStore.refreshInProgressKey.value = key;
 	sessionStore.switchInProgress.value = !!blockRealtimeEvents;
 	S.setSessionSwitchInProgress(!!blockRealtimeEvents);
+	updateModelComboAvailability();
 }
 
 function finishSessionRefresh(key: string): void {
@@ -154,6 +155,7 @@ function finishSessionRefresh(key: string): void {
 	sessionStore.refreshInProgressKey.value = "";
 	sessionStore.switchInProgress.value = false;
 	S.setSessionSwitchInProgress(false);
+	updateModelComboAvailability();
 }
 
 function resetSwitchViewState(): void {
