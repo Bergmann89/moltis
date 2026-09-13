@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260913.02] - 2026-09-13
+### Fixed
+- [web] Correct ACP auto-bind backoff and release E2E assertions
+
 ## [20260913.01] - 2026-09-13
 ### Added
 - [reasoning] Add max effort level (#1253)
