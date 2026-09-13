@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260913.01] - 2026-09-13
+### Added
+- [reasoning] Add max effort level (#1253)
+- [chat] Persist configurable default reasoning effort (#1266)
+
+
+### Fixed
+- [exec] Report missing shell accurately (#1260)
+- [telegram] Expose shared-chat tool policy controls (#1265)
+
 ## [20260902.03] - 2026-09-02
 
 ### Security
