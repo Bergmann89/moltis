@@ -120,6 +120,8 @@ function maybeAutoBindAcp(): void {
 	if (
 		!(session && sessionKey) ||
 		sessionKey.startsWith("cron:") ||
+		sessionStore.refreshInProgressKey.value === sessionKey ||
+		switchingBackendSessions.has(sessionKey) ||
 		!modelsLoaded ||
 		!externalAgentsLoaded ||
 		modelStore.models.value.length > 0 ||

@@ -588,6 +588,7 @@ test.describe("Agents settings page", () => {
 		await expect(page.locator("#modelComboLabel")).toHaveText("ACP: Copilot");
 		await expect(page.locator("#reasoningCombo")).toBeHidden();
 
+		const requestsBeforeUnbind = await page.evaluate(() => window.__externalAgentE2ERequests.length);
 		await picker.click();
 		await dropdown.getByText("E2E Model", { exact: true }).click();
 		await expect
@@ -610,12 +611,16 @@ test.describe("Agents settings page", () => {
 			.poll(
 				async () =>
 					page.evaluate(
-						(key) =>
-							(window.__externalAgentE2ERequests || []).some(
-								(req) =>
-									req.method === "sessions.patch" && req.params?.key === key && req.params?.model === "e2e/model",
-							),
-						sessionKey,
+						({ key, start }) =>
+							(window.__externalAgentE2ERequests || [])
+								.slice(start)
+								.some(
+									(req) =>
+										req.method === "sessions.patch" &&
+										req.params?.key === key &&
+										req.params?.model === "e2e/model@reasoning-high",
+								),
+						{ key: sessionKey, start: requestsBeforeUnbind },
 					),
 				{ timeout: 10_000 },
 			)
