@@ -68,7 +68,14 @@ RUN --mount=type=cache,id=moltis-npm,target=/root/.npm,sharing=locked \
 #
 # `sharing=locked` because two concurrent builds over one cargo target directory
 # is corruption rather than concurrency.
-RUN --mount=type=cache,id=moltis-cargo-target,target=/build/target,sharing=locked \
+#
+# The target cache is per-architecture, because cargo writes a native build to
+# target/release whatever it is building for: one builder alternating between
+# arm64 and amd64 would otherwise keep both architectures' artifacts in one
+# directory, under the same names. The registry and git caches are shared, as
+# downloaded sources are the same everywhere.
+ARG TARGETARCH
+RUN --mount=type=cache,id=moltis-cargo-target-${TARGETARCH},target=/build/target,sharing=locked \
     --mount=type=cache,id=moltis-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=moltis-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     rustup target add wasm32-wasip2 && \
@@ -84,22 +91,19 @@ RUN --mount=type=cache,id=moltis-cargo-target,target=/build/target,sharing=locke
 ARG MOLTIS_VERSION
 ENV MOLTIS_VERSION=${MOLTIS_VERSION}
 #
-# The zvec runtime is found rather than globbed, for two reasons that both come
-# from the target cache: a persistent target/ accumulates `zvec-rust-sys-*` build
-# directories from earlier builds, so the newest match is the only correct one -
-# a glob could pick a stale sibling. And zvec is a feature of `full`, so a
-# smaller feature set produces no such library at all; copying into a directory
-# that exists even when empty keeps that case a no-op instead of a failed COPY.
-RUN --mount=type=cache,id=moltis-cargo-target,target=/build/target,sharing=locked \
+# The zvec runtime is searched for rather than globbed, because the target cache
+# keeps `zvec-rust-sys-*` build directories from earlier builds and a glob could
+# pick a stale sibling. scripts/stage-zvec-runtime.sh takes the newest one that
+# matches the binary just built - see its header for why the timestamp alone is
+# not enough. It is also a no-op when the feature set produced no such library,
+# which is what lets the runtime stage COPY /out/lib/ unconditionally.
+RUN --mount=type=cache,id=moltis-cargo-target-${TARGETARCH},target=/build/target,sharing=locked \
     --mount=type=cache,id=moltis-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=moltis-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     ./scripts/cargo-build-moltis.sh --release && \
     mkdir -p /out/lib && \
     cp target/release/moltis /out/moltis && \
-    so="$(find target/release/build \
-            -path '*zvec-rust-sys-*/out/zvec-prebuilt/libzvec_c_api.so' \
-            -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)" && \
-    if [ -n "$so" ]; then cp "$so" /out/lib/; else echo "no zvec runtime in this feature set"; fi
+    ./scripts/stage-zvec-runtime.sh target/release/moltis /out/lib
 
 # Runtime stage
 FROM debian:trixie-slim

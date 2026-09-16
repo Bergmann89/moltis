@@ -7,12 +7,11 @@
 #
 # The Dockerfile keeps cargo's target directory and crate registry in BuildKit
 # cache mounts, so a rebuild recompiles what changed rather than the whole
-# dependency tree. Those mounts live in the BuildKit cache and survive
-# --no-cache; --cache-dir is a separate thing, an exportable cache of the image
-# *layers*, which is what carries a build across machines or a pruned daemon.
-#
-# scripts/build-and-load-remote.sh builds through this script and then streams
-# the result onto another host.
+# dependency tree. Those mounts live in the BuildKit cache, outside the layers
+# --no-cache discards - a --no-cache build does not empty them, but it does not
+# get to use them either. --cache-dir is a separate thing again, an exportable
+# cache of the image *layers*, which is what carries a build across machines or
+# a pruned daemon.
 
 set -euo pipefail
 
@@ -30,8 +29,8 @@ Options:
       --build-arg KEY=VALUE  Extra build arg (repeatable)
       --build-context N=PATH Extra named build context (repeatable)
       --cache-dir DIR        Import and export the image layer cache here
-      --no-cache             Ignore the layer cache. Does not empty the cargo
-                             cache mounts, which is usually what you want
+      --no-cache             Ignore the layer cache. Keeps the cargo cache
+                             mounts but builds without them - see No-cache below
       --allow-emulation      Build a platform this machine is not. Required for
                              that case - see Emulation below
       --no-binfmt            Never try to register QEMU handlers
@@ -44,6 +43,12 @@ Version:
   version string is empty, which also means it does not identify as a dev build:
   its update checker stays active and `/update` will offer to replace the binary.
   Pass --version, or leave it and know that the image is the update mechanism.
+
+No-cache:
+  --no-cache hands the build a fresh, empty copy of every cache mount, so cargo
+  compiles the whole dependency tree again - the full cold build, 47 minutes on
+  a Pi 5. The existing mounts are not destroyed by it and the next build without
+  the flag finds them as they were, so this costs time rather than work.
 
 Emulation:
   Building for a platform this machine is not means QEMU, and QEMU emulates
@@ -70,11 +75,29 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-case "$(uname -m)" in
-  x86_64|amd64)  host_platform="linux/amd64" ;;
-  aarch64|arm64) host_platform="linux/arm64" ;;
-  *)             host_platform="linux/$(uname -m)" ;;
-esac
+# Reduce a platform to the os/arch pair docker reports, so that the spellings
+# buildx accepts all compare equal: `linux/arm64/v8` carries a variant docker
+# inspect never prints back, `linux/aarch64` is an alias, and a bare `arm64`
+# means linux. Only comparisons use this - buildx itself is handed the platform
+# as it was given, variant and all.
+os_arch() {
+  local given="$1" os arch
+  if [[ "$given" == */* ]]; then
+    os="${given%%/*}"
+    arch="${given#*/}"
+    arch="${arch%%/*}"
+  else
+    os="linux"
+    arch="$given"
+  fi
+  case "$arch" in
+    x86_64|amd64)  arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+  esac
+  printf '%s/%s' "$os" "$arch"
+}
+
+host_platform="$(os_arch "$(uname -m)")"
 
 tag="moltis:local"
 platform="$host_platform"
@@ -149,7 +172,9 @@ fi
 
 # --- emulation ---------------------------------------------------------------
 
-if [[ "$platform" != "$host_platform" ]]; then
+platform_key="$(os_arch "$platform")"
+
+if [[ "$platform_key" != "$host_platform" ]]; then
   if (( ! allow_emulation )); then
     echo "refusing to build ${platform} on a ${host_platform} host." >&2
     echo "" >&2
@@ -165,11 +190,11 @@ if [[ "$platform" != "$host_platform" ]]; then
   if (( install_binfmt )); then
     if (( dry_run )); then
       log "dry run: would check the builder for ${platform} and register QEMU handlers if absent"
-    elif docker buildx inspect --bootstrap 2>/dev/null | grep -q -- "$platform"; then
-      log "builder already advertises ${platform}"
+    elif docker buildx inspect --bootstrap 2>/dev/null | grep -q -- "$platform_key"; then
+      log "builder already advertises ${platform_key}"
     else
-      log "registering QEMU handlers for ${platform#linux/} (privileged container)"
-      run docker run --privileged --rm tonistiigi/binfmt --install "${platform#linux/}"
+      log "registering QEMU handlers for ${platform_key#*/} (privileged container)"
+      run docker run --privileged --rm tonistiigi/binfmt --install "${platform_key#*/}"
     fi
   fi
 fi
