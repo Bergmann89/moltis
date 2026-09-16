@@ -647,6 +647,12 @@ function fetchBootstrap(): void {
 				}
 			}
 			S.setSandboxInfo(boot.sandbox || null);
+			// The forced flag rides every session entry, but nothing applied it on a
+			// cold load: the toggle stayed clickable for a forced agent until the
+			// first session switch. Apply the active session's flag, then re-apply
+			// the sandbox UI so the button picks up its disabled state.
+			const activeEntry = sessionStore.getByKey(sessionStore.activeSessionKey.value || S.activeSessionKey);
+			if (activeEntry) S.setSessionSandboxForced(activeEntry.sandbox_forced === true);
 			// Re-apply sandbox UI now that we know the backend status.
 			// This fixes the race where the chat page renders before bootstrap completes.
 			updateSandboxUI(S.sessionSandboxEnabled);

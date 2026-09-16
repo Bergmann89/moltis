@@ -169,6 +169,76 @@ async fn test_credential_store_api_keys_with_scopes() {
     assert!(store.verify_api_key(&raw_key2).await.unwrap().is_some());
 }
 
+/// The two store primitives the gateway's sandbox-key rotation is built from.
+///
+/// The gateway has no key id and no env-var id to work from at startup - all
+/// it knows is the label it minted under and the name it cached under - so
+/// retiring the old read+write sandbox key means listing, matching, and then
+/// revoking/deleting by the id the listing hands back. If either listing
+/// stopped surfacing what the rotation matches on, or a revoke left the key
+/// usable, an upgraded install would quietly keep its old key.
+#[tokio::test]
+async fn test_credential_store_retires_a_key_and_its_cached_env_var_by_listing() {
+    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    let store = CredentialStore::new(pool).await.unwrap();
+
+    let scopes = vec!["operator.read".to_string(), "operator.write".to_string()];
+    let (_id, raw_key) = store
+        .create_api_key("sandbox-ctl", Some(&scopes))
+        .await
+        .unwrap();
+    store
+        .set_env_var("__MOLTIS_SANDBOX_API_KEY", &raw_key)
+        .await
+        .unwrap();
+
+    let stale: Vec<i64> = store
+        .list_api_keys()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.label == "sandbox-ctl")
+        .map(|entry| entry.id)
+        .collect();
+    assert_eq!(stale.len(), 1, "the label has to be enough to find the key");
+    for id in stale {
+        store.revoke_api_key(id).await.unwrap();
+    }
+    assert!(
+        store.verify_api_key(&raw_key).await.unwrap().is_none(),
+        "a revoked key must stop authenticating, not merely stop being handed out"
+    );
+
+    let cached: Vec<i64> = store
+        .list_env_vars()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|var| var.key == "__MOLTIS_SANDBOX_API_KEY")
+        .map(|var| var.id)
+        .collect();
+    assert_eq!(
+        cached.len(),
+        1,
+        "the name has to be enough to find the entry"
+    );
+    for id in cached {
+        assert_eq!(
+            store.delete_env_var(id).await.unwrap().as_deref(),
+            Some("__MOLTIS_SANDBOX_API_KEY")
+        );
+    }
+    assert!(
+        store
+            .get_all_env_values()
+            .await
+            .unwrap()
+            .iter()
+            .all(|(key, _)| key != "__MOLTIS_SANDBOX_API_KEY"),
+        "the stale cache entry must be gone, or the next startup reuses it"
+    );
+}
+
 #[tokio::test]
 async fn test_credential_store_reset_all() {
     let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
