@@ -265,3 +265,119 @@ async fn sessions_switch_stamps_the_forced_flag_on_its_entry() {
         "the switch entry must carry the flag too: {entry}"
     );
 }
+
+/// A gateway state with a persona store, so `agents.set_session` can move a
+/// session onto an agent other than `main`.
+///
+/// Without one, `agent_exists_for_ctx` accepts only `"main"` and the switch
+/// under test never happens.
+async fn state_with_two_agents(
+    key: &str,
+    agent_id: &str,
+) -> (Arc<GatewayState>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("a session store dir");
+    let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+    let pool = sqlite_pool().await;
+    sqlx::query(
+        r"CREATE TABLE IF NOT EXISTS agents (
+            id                TEXT PRIMARY KEY,
+            name              TEXT NOT NULL,
+            is_default        INTEGER NOT NULL DEFAULT 0,
+            emoji             TEXT,
+            theme             TEXT,
+            description       TEXT,
+            voice_persona_id  TEXT,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("the agents schema");
+    for id in ["main", "walter"] {
+        sqlx::query(
+            "INSERT INTO agents (id, name, is_default, created_at, updated_at) \
+             VALUES (?, ?, 0, 0, 0)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("an agent row");
+    }
+    let metadata = Arc::new(SqliteSessionMetadata::new(pool.clone()));
+    metadata.upsert(key, None).await.expect("the session");
+    metadata
+        .set_agent_id(key, Some(agent_id))
+        .await
+        .expect("the session's agent");
+    let service = LiveSessionService::new(store, Arc::clone(&metadata));
+    let personas = Arc::new(crate::agent_persona::AgentPersonaStore::new(pool));
+    let state = GatewayState::new(
+        ResolvedAuth {
+            mode: AuthMode::Token,
+            token: None,
+            password: None,
+        },
+        GatewayServices::noop()
+            .with_session(Arc::new(service))
+            .with_session_metadata(metadata)
+            .with_agent_persona_store(personas),
+    );
+    (state, dir)
+}
+
+fn forced_in(response: &ResponseFrame) -> Option<&serde_json::Value> {
+    response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("sandbox_forced"))
+}
+
+#[tokio::test]
+async fn agents_set_session_reports_the_new_agent_forcing_its_sandbox() {
+    // Switching the session's agent is the one path that changes the answer
+    // without going through `sessions.list` or `sessions.switch`. The browser
+    // is holding a toggle painted for the *old* agent, and this reply is all
+    // it gets.
+    let guard = DataDirGuard::new();
+    let (state, _dir) = state_with_two_agents("session:chat", "main").await;
+    guard.write_agent_def("walter", "sandbox_force: true\n");
+
+    let response = dispatch(
+        Arc::clone(&state),
+        "agents.set_session",
+        serde_json::json!({ "session_key": "session:chat", "agent_id": "walter" }),
+    )
+    .await;
+
+    assert!(response.ok, "the switch must succeed: {response:?}");
+    assert_eq!(
+        forced_in(&response),
+        Some(&serde_json::Value::Bool(true)),
+        "the reply must say the toggle is no longer a control: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn agents_set_session_gives_the_toggle_back_when_leaving_a_forced_agent() {
+    // The mirror case, and the one a hardcoded `true` would pass: switching
+    // away from a forced agent has to hand the control back.
+    let guard = DataDirGuard::new();
+    let (state, _dir) = state_with_two_agents("session:chat", "walter").await;
+    guard.write_agent_def("walter", "sandbox_force: true\n");
+
+    let response = dispatch(
+        Arc::clone(&state),
+        "agents.set_session",
+        serde_json::json!({ "session_key": "session:chat", "agent_id": "main" }),
+    )
+    .await;
+
+    assert!(response.ok, "the switch must succeed: {response:?}");
+    assert_eq!(
+        forced_in(&response),
+        Some(&serde_json::Value::Bool(false)),
+        "main does not force, so the toggle is a control again: {response:?}"
+    );
+}

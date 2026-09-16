@@ -381,7 +381,19 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     meta.set_agent_id(session_key, Some(&agent_id))
                         .await
                         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-                    Ok(serde_json::json!({ "ok": true, "agent_id": agent_id }))
+                    // The new agent may force its sandbox where the old one did
+                    // not, or the other way round. The caller is holding a
+                    // toggle whose enabled-ness is the old agent's answer, and
+                    // this reply is the only one it gets for the switch, so it
+                    // carries the new answer rather than making the caller
+                    // guess or re-list.
+                    let sandbox_forced =
+                        crate::sandbox_policy::agent_sandbox_forced(Some(&agent_id));
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "agent_id": agent_id,
+                        "sandbox_forced": sandbox_forced,
+                    }))
                 })
             }),
         );
