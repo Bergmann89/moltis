@@ -91,6 +91,32 @@ RUN --mount=type=cache,id=moltis-cargo-target-${TARGETARCH},target=/build/target
 ARG MOLTIS_VERSION
 ENV MOLTIS_VERSION=${MOLTIS_VERSION}
 #
+# Peak memory here is the size of one rustc, not the number of them.
+# [profile.release] sets `codegen-units = 1`, so each crate is a single LLVM
+# module, and `lto = "thin"`, which additionally makes every dependency emit
+# bitcode for the final link. moltis-gateway on its own can exceed a small
+# builder's entire budget that way, and the whole-program link at the end is
+# larger still - a memory-limited builder gets SIGKILL rather than a diagnostic.
+#
+# The defaults below reproduce [profile.release] exactly, so a plain build
+# resolves to the same profile and reuses the cargo cache. Overriding either of
+# the last two changes cargo's profile fingerprint and therefore rebuilds the
+# whole release tree, and trades a larger, slightly slower binary for a much
+# lower peak:
+#
+#   --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+#   --build-arg CARGO_PROFILE_RELEASE_LTO=false
+#
+# BUILD_JOBS is the cheap knob: it caps how many compile at once without
+# touching the fingerprint, so the cache survives. It does not help when a
+# single crate is what does not fit.
+ARG BUILD_JOBS=2
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ARG CARGO_PROFILE_RELEASE_LTO=thin
+ENV CARGO_BUILD_JOBS=${BUILD_JOBS} \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS} \
+    CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO}
+#
 # The zvec runtime is searched for rather than globbed, because the target cache
 # keeps `zvec-rust-sys-*` build directories from earlier builds and a glob could
 # pick a stale sibling. scripts/stage-zvec-runtime.sh takes the newest one that
