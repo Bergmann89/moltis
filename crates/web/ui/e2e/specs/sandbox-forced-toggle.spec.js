@@ -43,14 +43,14 @@ async function mockSandboxBackends(page, available) {
  */
 async function applySessionPolicy(page, { forced, enabled }) {
 	await page.evaluate(
-		async ([forced, enabled]) => {
+		async ([isForced, isEnabled]) => {
 			var appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
 			var appUrl = new URL(appScript.src, window.location.origin);
 			var prefix = appUrl.href.slice(0, appUrl.href.length - "js/app.js".length);
 			var S = await import(`${prefix}js/state.js`);
 			var sandbox = await import(`${prefix}js/sandbox.js`);
-			S.setSessionSandboxForced(forced);
-			sandbox.updateSandboxUI(enabled);
+			S.setSessionSandboxForced(isForced);
+			sandbox.updateSandboxUI(isEnabled);
 		},
 		[forced, enabled],
 	);
