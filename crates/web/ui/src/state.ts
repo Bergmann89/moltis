@@ -62,7 +62,7 @@ export let projectDropdownList: HTMLElement | null = null;
 export let sandboxToggleBtn: HTMLButtonElement | null = null;
 export let sandboxLabel: HTMLElement | null = null;
 export let sessionSandboxEnabled = true;
-/** The active session's agent forces its sandbox on (mounts or run_as). */
+/** The active session's agent preset sets `sandbox.force`. */
 export let sessionSandboxForced = false;
 export let sessionSandboxImage: string | null = null;
 export let sessionSandboxBackend: string | null = null;

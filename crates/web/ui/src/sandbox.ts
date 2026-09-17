@@ -175,8 +175,10 @@ export function bindSandboxToggleEvents(): void {
 	toggleBtn.addEventListener("click", () => {
 		if (!sandboxRuntimeAvailable()) return;
 		// Belt and braces next to the `disabled` attribute: this session's agent
-		// declares mounts or a run_as, which the gateway honors only in a
-		// sandbox, so there is nothing to toggle.
+		// preset sets `sandbox.force`, so the gateway refuses to switch the
+		// sandbox off and there is nothing to toggle. Sibling mounts and
+		// `run_as` do not get here - they configure the sandbox rather than
+		// require one.
 		if (S.sessionSandboxForced) return;
 		const newVal = !S.sessionSandboxEnabled;
 		sendRpc<SessionPatchEntry>("sessions.patch", {

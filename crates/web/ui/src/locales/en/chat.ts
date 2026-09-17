@@ -38,7 +38,7 @@ export default {
 		"Sandboxes are disabled on cloud deploys without a container runtime. Install on a VM with Docker or Apple Container to enable this feature.",
 	sandboxToggleTooltip: "Toggle sandbox mode",
 	sandboxForcedHint:
-		"This agent's sandbox is required by its mounts or run_as and cannot be turned off.",
+		"This agent's preset sets sandbox.force, so its sandbox cannot be turned off.",
 	sandboxImageTooltip: "Sandbox image",
 	mcpEnabled: "MCP",
 	mcpEnabledTooltip: "MCP tools enabled \u2014 click to disable for this session",
