@@ -31,6 +31,13 @@ use {
 // payload ceiling (a control byte may serialize as six ASCII bytes).
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
+/// Default liveness deadline, in seconds.
+///
+/// One value, used by [`NodeConfig::default`], by the persisted
+/// [`crate::ServiceConfig`] and by the `--pong-deadline` flag, so the three
+/// cannot drift apart.
+pub const DEFAULT_PONG_DEADLINE_SECS: u64 = 20;
+
 async fn read_output_limited(mut reader: impl AsyncRead + Unpin) -> std::io::Result<String> {
     let mut output = Vec::with_capacity(MAX_OUTPUT_BYTES.min(64 * 1024));
     let mut buffer = [0_u8; 8 * 1024];
@@ -80,6 +87,12 @@ pub struct NodeConfig {
     pub working_dir: Option<String>,
     /// Executable paths or names that this node permits the gateway to run.
     pub allowed_programs: Vec<String>,
+    /// How often the node reports telemetry to the gateway.
+    pub telemetry_interval: Duration,
+    /// How long the node waits for any frame from the gateway before it sends a
+    /// liveness Ping, and how long it then waits for the Pong before it gives
+    /// up on the link. Detection therefore costs between one and two of these.
+    pub pong_deadline: Duration,
 }
 
 impl Default for NodeConfig {
@@ -104,6 +117,8 @@ impl Default for NodeConfig {
             exec_timeout: Duration::from_secs(300),
             working_dir: None,
             allowed_programs: Vec::new(),
+            telemetry_interval: Duration::from_secs(30),
+            pong_deadline: Duration::from_secs(DEFAULT_PONG_DEADLINE_SECS),
         }
     }
 }
@@ -274,29 +289,61 @@ impl NodeHost {
             "handshake complete, node registered"
         );
 
-        // Main message loop with telemetry ticker.
-        let mut telemetry_interval = tokio::time::interval(Duration::from_secs(30));
+        self.run_loop(&mut ws_tx, &mut ws_rx).await;
+
+        info!("node disconnected");
+        Ok(())
+    }
+
+    /// Drive an already-connected socket until the link ends.
+    ///
+    /// Split out of [`NodeHost::run`] on purpose: `run` can only be driven by a
+    /// real gateway, while this takes any sink and stream pair, so the states a
+    /// real socket cannot be put into - a send that fails while the read side
+    /// stays pending - are reachable from a test.
+    async fn run_loop(
+        &self,
+        ws_tx: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+        ws_rx: &mut (
+                 impl StreamExt<
+            Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+        > + Unpin
+             ),
+    ) {
+        // Main message loop with telemetry and liveness tickers.
+        let mut telemetry_interval = tokio::time::interval(self.config.telemetry_interval);
         // Skip the immediate first tick — send telemetry after the first interval.
         telemetry_interval.tick().await;
+
+        let mut liveness_interval = tokio::time::interval(self.config.pong_deadline);
+        liveness_interval.tick().await;
+        // True once a liveness Ping has gone out with nothing heard since.
+        let mut awaiting_pong = false;
 
         loop {
             tokio::select! {
                 msg = ws_rx.next() => {
                     match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            self.handle_message(&text, &mut ws_tx).await;
-                        },
-                        Some(Ok(Message::Ping(data))) => {
-                            if let Err(e) = ws_tx.send(Message::Pong(data)).await {
-                                warn!(error = %e, "failed to send pong");
-                                break;
+                        Some(Ok(message)) => {
+                            // Any frame at all proves the peer is still there.
+                            awaiting_pong = false;
+                            match message {
+                                Message::Text(text) => {
+                                    self.handle_message(&text, ws_tx).await;
+                                },
+                                Message::Ping(data) => {
+                                    if let Err(e) = ws_tx.send(Message::Pong(data)).await {
+                                        warn!(error = %e, "failed to send pong");
+                                        break;
+                                    }
+                                },
+                                Message::Close(_) => {
+                                    info!("gateway closed connection");
+                                    break;
+                                },
+                                _ => {},
                             }
                         },
-                        Some(Ok(Message::Close(_))) => {
-                            info!("gateway closed connection");
-                            break;
-                        },
-                        Some(Ok(_)) => {},
                         Some(Err(e)) => {
                             error!(error = %e, "websocket error");
                             break;
@@ -308,13 +355,31 @@ impl NodeHost {
                     }
                 },
                 _ = telemetry_interval.tick() => {
-                    self.send_telemetry(&mut ws_tx).await;
+                    // A telemetry send that fails means the route is gone. The
+                    // read side can stay pending forever in that state, so the
+                    // write side is the only thing that notices: end the loop
+                    // and let the supervisor dial again.
+                    if let Err(e) = self.send_telemetry(ws_tx).await {
+                        warn!(error = %e, "telemetry send failed, link is dead");
+                        break;
+                    }
+                },
+                _ = liveness_interval.tick() => {
+                    // A live route with a dead peer: the socket still accepts
+                    // writes, so nothing above notices. The previous Ping went
+                    // unanswered for a full deadline, so give up on the link.
+                    if awaiting_pong {
+                        warn!("no reply within the pong deadline, link is dead");
+                        break;
+                    }
+                    if let Err(e) = ws_tx.send(Message::Ping(Default::default())).await {
+                        warn!(error = %e, "failed to send liveness ping");
+                        break;
+                    }
+                    awaiting_pong = true;
                 },
             }
         }
-
-        info!("node disconnected");
-        Ok(())
     }
 
     /// Drive the handshake to completion, handling an optional challenge-response
@@ -754,10 +819,15 @@ impl NodeHost {
         }
     }
 
+    /// Send one telemetry frame.
+    ///
+    /// Returns `Err` when the frame could not be handed to the sink. A failed
+    /// write means the link is gone: the caller must not keep looping on a
+    /// sink that can no longer deliver anything.
     async fn send_telemetry(
         &self,
         ws_tx: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
-    ) {
+    ) -> Result<()> {
         let telemetry = collect_system_telemetry(&self.config.node_id);
         let frame = serde_json::json!({
             "type": "req",
@@ -769,11 +839,13 @@ impl NodeHost {
             }
         });
 
-        if let Ok(json) = serde_json::to_string(&frame)
-            && let Err(e) = ws_tx.send(Message::Text(json.into())).await
-        {
+        let json = serde_json::to_string(&frame)?;
+        if let Err(e) = ws_tx.send(Message::Text(json.into())).await {
             debug!(error = %e, "failed to send telemetry");
+            return Err(e.into());
         }
+
+        Ok(())
     }
 
     async fn send_invoke_error(
@@ -968,5 +1040,160 @@ mod tests {
 
         let error = host.handle_system_exec(&args).await.unwrap_err();
         assert!(error.to_string().contains("outside execution root"));
+    }
+
+    /// A sink that rejects every send, the way a socket behaves once its route
+    /// is gone: the write never leaves the host.
+    struct DeadLinkSink;
+
+    impl futures::Sink<Message> for DeadLinkSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn send_telemetry_reports_a_failed_send() {
+        let host = NodeHost::new(NodeConfig::default());
+        let mut sink = DeadLinkSink;
+
+        let result = host.send_telemetry(&mut sink).await;
+
+        assert!(
+            result.is_err(),
+            "a telemetry send that never left the host must be reported to the caller"
+        );
+    }
+
+    /// A stream that never yields, the way a black-holed read side behaves:
+    /// nothing arrives and nothing closes.
+    struct PendingStream;
+
+    impl futures::Stream for PendingStream {
+        type Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// The state a real socket cannot be put into, which is why `run_loop` is a
+    /// seam: the write side is gone while the read side stays pending, so the
+    /// loop's read arm never fires and only the telemetry arm can end it.
+    #[tokio::test]
+    async fn run_loop_ends_when_telemetry_cannot_be_sent() {
+        let config = NodeConfig {
+            telemetry_interval: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let host = NodeHost::new(config);
+        let mut ws_tx = DeadLinkSink;
+        let mut ws_rx = PendingStream;
+
+        let ended = tokio::time::timeout(
+            Duration::from_secs(3),
+            host.run_loop(&mut ws_tx, &mut ws_rx),
+        )
+        .await;
+
+        assert!(
+            ended.is_ok(),
+            "the run loop must end once telemetry can no longer be delivered"
+        );
+    }
+
+    /// A gateway that completes the v4 handshake and then stops answering.
+    ///
+    /// Replying `hello-ok` is the point: `run()` blocks in `complete_handshake`
+    /// before the loop is ever reached, so a server that merely accepts the
+    /// socket would end `run()` through the handshake timeout - red and green
+    /// for the wrong reason.
+    async fn gateway_that_goes_silent_after_hello() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            while let Some(Ok(message)) = ws.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame.get("method").and_then(serde_json::Value::as_str) != Some("connect") {
+                    continue;
+                }
+                let hello = serde_json::json!({
+                    "type": "res",
+                    "id": frame.get("id").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                    "ok": true,
+                    "payload": { "server": { "version": "test" } },
+                });
+                ws.send(Message::Text(hello.to_string().into()))
+                    .await
+                    .unwrap();
+                break;
+            }
+
+            // Go silent: hold the socket open and never poll it again, so an
+            // inbound Ping is never answered. Dropping `ws` would close the
+            // connection and end the loop through the read arm instead.
+            std::future::pending::<()>().await;
+        });
+
+        format!("ws://{addr}/ws")
+    }
+
+    #[tokio::test]
+    async fn run_ends_when_the_peer_stops_answering() {
+        let config = NodeConfig {
+            gateway_url: gateway_that_goes_silent_after_hello().await,
+            // `identity: None` keeps the handshake timeout at 10 s; an identity
+            // raises it to 310 s, which would look exactly like the hang this
+            // test exists to rule out.
+            identity: None,
+            // Long enough that the telemetry break cannot be what ends the run.
+            telemetry_interval: Duration::from_secs(60),
+            pong_deadline: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let host = NodeHost::new(config);
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), host.run()).await;
+
+        assert!(
+            ended.is_ok(),
+            "the run loop must end when the peer stops answering liveness pings"
+        );
     }
 }

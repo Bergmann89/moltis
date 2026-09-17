@@ -58,6 +58,9 @@ pub enum NodeAction {
         /// Maximum command timeout in seconds.
         #[arg(long, default_value = "300")]
         timeout: u64,
+        /// Seconds without a reply from the gateway before the link is dead.
+        #[arg(long, default_value_t = moltis_node_host::DEFAULT_PONG_DEADLINE_SECS)]
+        pong_deadline: u64,
         /// Executable path or name allowed for remote execution (repeatable).
         #[arg(long = "allow-program")]
         allowed_programs: Vec<String>,
@@ -187,6 +190,7 @@ pub async fn handle_node(action: NodeAction) -> Result<()> {
             node_id,
             working_dir,
             timeout,
+            pong_deadline,
             allowed_programs,
             foreground,
         } => {
@@ -236,6 +240,8 @@ pub async fn handle_node(action: NodeAction) -> Result<()> {
                     exec_timeout: Duration::from_secs(timeout),
                     working_dir,
                     allowed_programs,
+                    pong_deadline: Duration::from_secs(pong_deadline),
+                    ..Default::default()
                 };
 
                 let node = moltis_node_host::NodeHost::new(config);
@@ -251,6 +257,7 @@ pub async fn handle_node(action: NodeAction) -> Result<()> {
                     working_dir,
                     timeout,
                     allowed_programs,
+                    pong_deadline,
                 };
 
                 moltis_node_host::service::install(&data_dir, &svc_config)?;
@@ -270,34 +277,10 @@ pub async fn handle_node(action: NodeAction) -> Result<()> {
                     "cannot load node config: {e}\nRun `moltis node add` first to register this machine."
                 ))?;
 
-            let exec_timeout = Duration::from_secs(timeout.unwrap_or(config.timeout));
-
             let key_dir = moltis_config::data_dir();
             let identity = moltis_node_host::identity::load_or_create(&key_dir).ok();
 
-            let node_config = moltis_node_host::NodeConfig {
-                gateway_url: config.gateway_url,
-                device_token: config.device_token,
-                identity,
-                node_id: config
-                    .node_id
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                display_name: config.display_name,
-                platform: std::env::consts::OS.into(),
-                caps: vec![
-                    moltis_node_host::SYSTEM_EXEC_COMMAND.into(),
-                    "system.which".into(),
-                    "system.providers".into(),
-                ],
-                commands: vec![
-                    moltis_node_host::SYSTEM_EXEC_COMMAND.into(),
-                    "system.which".into(),
-                    "system.providers".into(),
-                ],
-                exec_timeout,
-                working_dir: config.working_dir,
-                allowed_programs: config.allowed_programs,
-            };
+            let node_config = config.to_node_config(identity, timeout);
 
             let node = moltis_node_host::NodeHost::new(node_config);
             node.run().await?;
@@ -383,6 +366,7 @@ pub async fn handle_node(action: NodeAction) -> Result<()> {
                 exec_timeout: Duration::from_secs(10),
                 working_dir: None,
                 allowed_programs: Vec::new(),
+                ..Default::default()
             };
 
             // Connect with both token and key. The gateway pins the key
