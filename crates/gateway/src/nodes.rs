@@ -67,15 +67,34 @@ impl NodeRegistry {
         }
     }
 
+    /// Register a node session, replacing any previous session for the same node.
+    ///
+    /// A reconnecting node arrives on a fresh connection while the stale one may
+    /// still be in the map, so the previous `by_conn` entry pointing at this
+    /// `node_id` is evicted here rather than left behind to be cleaned up by a
+    /// later disconnect of the dead connection.
     pub fn register(&mut self, session: NodeSession) {
+        if let Some(previous) = self.nodes.get(&session.node_id)
+            && previous.conn_id != session.conn_id
+        {
+            self.by_conn.remove(&previous.conn_id);
+        }
         self.by_conn
             .insert(session.conn_id.clone(), session.node_id.clone());
         self.nodes.insert(session.node_id.clone(), session);
     }
 
+    /// Remove the session owned by `conn_id`, if that connection still owns it.
+    ///
+    /// Returns `None` when the connection is stale - i.e. the node has since
+    /// reconnected on another connection - so a late disconnect of the dead
+    /// connection can never tear down the healthy session.
     pub fn unregister_by_conn(&mut self, conn_id: &str) -> Option<NodeSession> {
         let node_id = self.by_conn.remove(conn_id)?;
-        self.nodes.remove(&node_id)
+        match self.nodes.get(&node_id) {
+            Some(session) if session.conn_id == conn_id => self.nodes.remove(&node_id),
+            _ => None,
+        }
     }
 
     pub fn get(&self, node_id: &str) -> Option<&NodeSession> {
@@ -138,5 +157,62 @@ impl NodeRegistry {
 
     pub fn count(&self) -> usize {
         self.nodes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(node_id: &str, conn_id: &str) -> NodeSession {
+        NodeSession {
+            node_id: node_id.to_string(),
+            conn_id: conn_id.to_string(),
+            display_name: None,
+            platform: "linux".to_string(),
+            version: "0.0.0".to_string(),
+            capabilities: Vec::new(),
+            commands: Vec::new(),
+            permissions: HashMap::new(),
+            path_env: None,
+            remote_ip: None,
+            connected_at: Instant::now(),
+            mem_total: None,
+            mem_available: None,
+            cpu_count: None,
+            cpu_usage: None,
+            uptime_secs: None,
+            services: Vec::new(),
+            last_telemetry: None,
+            disk_total: None,
+            disk_available: None,
+            runtimes: Vec::new(),
+            providers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconnect_then_stale_unregister_keeps_the_live_session() {
+        let mut registry = NodeRegistry::new();
+
+        registry.register(session("node-x", "conn-1"));
+        registry.register(session("node-x", "conn-2"));
+
+        let removed = registry.unregister_by_conn("conn-1");
+
+        assert!(
+            removed.is_none(),
+            "a stale conn must not report a removal it did not perform"
+        );
+        assert!(
+            registry.get("node-x").is_some(),
+            "the live session must survive the stale conn's cleanup"
+        );
+        assert_eq!(registry.count(), 1);
+        assert!(!registry.by_conn.contains_key("conn-1"));
+        assert_eq!(
+            registry.by_conn.get("conn-2").map(String::as_str),
+            Some("node-x")
+        );
     }
 }
