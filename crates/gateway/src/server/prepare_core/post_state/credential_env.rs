@@ -87,31 +87,99 @@ pub(super) async fn ensure_sandbox_api_key(store: &auth::CredentialStore) -> Opt
         return Some(key.clone());
     }
 
-    retire_old_sandbox_api_keys(store).await;
+    // Snapshot the keys to retire *before* minting, and retire only these.
+    //
+    // Retiring first and by label revoked whatever carried the label at that
+    // moment, which on two gateways sharing one database is not necessarily an
+    // old key. Both miss the cache, one mints, the other's retirement pass
+    // lists that brand-new key and revokes it, and the first gateway then
+    // injects a dead credential into every sandbox it starts. A key minted
+    // after this line cannot be in this list, so no startup can revoke another
+    // startup's fresh key.
+    let superseded = superseded_sandbox_key_ids(store).await;
 
     let scopes = auth::SANDBOX_API_KEY_SCOPES
         .iter()
         .map(|scope| (*scope).to_string())
         .collect::<Vec<_>>();
-    match store
+    let (new_id, raw_key) = match store
         .create_api_key(SANDBOX_API_KEY_LABEL, Some(&scopes))
         .await
     {
-        Ok((_id, raw_key)) => {
-            if let Err(e) = store.set_env_var(SANDBOX_API_KEY_ENV, &raw_key).await {
-                warn!(error = %e, "failed to persist sandbox API key");
-            }
+        Ok(minted) => minted,
+        Err(e) => {
+            warn!(error = %e, "failed to create sandbox API key");
+            return None;
+        },
+    };
+
+    // Publishing the cache entry is the atomic step that picks the winner:
+    // the env var key is UNIQUE, so exactly one concurrent startup inserts it.
+    match store
+        .set_env_var_if_absent(SANDBOX_API_KEY_ENV, &raw_key)
+        .await
+    {
+        Ok(true) => {
+            retire_superseded_sandbox_keys(store, &superseded).await;
             info!(scopes = ?scopes, "created sandbox-ctl API key for moltis-ctl");
             Some(raw_key)
         },
+        Ok(false) => {
+            // Another startup published first. Its key is the one every
+            // sandbox will be handed, so ours was never live anywhere: revoke
+            // it rather than leave a valid spare credential in the store, and
+            // retire nothing - the winner owns that.
+            if let Err(e) = store.revoke_api_key(new_id).await {
+                warn!(error = %e, id = new_id, "failed to revoke the losing sandbox API key");
+            }
+            info!("a concurrent startup published the sandbox key first, adopting it");
+            match store.get_all_env_values().await {
+                Ok(vals) => vals
+                    .into_iter()
+                    .find(|(k, _)| k == SANDBOX_API_KEY_ENV)
+                    .map(|(_, v)| v)
+                    .or_else(|| {
+                        warn!("the published sandbox API key vanished before it could be read");
+                        None
+                    }),
+                Err(e) => {
+                    warn!(error = %e, "failed to re-read the published sandbox API key");
+                    None
+                },
+            }
+        },
         Err(e) => {
-            warn!(error = %e, "failed to create sandbox API key");
-            None
+            // The key is valid, it just is not cached, so this boot works and
+            // the next one mints again. Retire nothing: without a published
+            // cache entry there is no winner, and revoking here would be the
+            // very race this ordering exists to avoid.
+            warn!(error = %e, "failed to persist sandbox API key");
+            Some(raw_key)
         },
     }
 }
 
-/// Revoke every previously minted sandbox key and drop the v1 cache entry.
+/// The ids of the sandbox keys that exist right now.
+///
+/// Captured before a new key is minted, so that the retirement pass can name
+/// exactly the keys this startup is replacing instead of "whatever carries the
+/// label when I get around to it" - which is how a concurrent startup's fresh
+/// key ended up in the revoke list.
+async fn superseded_sandbox_key_ids(store: &auth::CredentialStore) -> Vec<i64> {
+    match store.list_api_keys().await {
+        Ok(keys) => keys
+            .iter()
+            .filter(|e| e.label == SANDBOX_API_KEY_LABEL)
+            .map(|e| e.id)
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "failed to list API keys while rotating the sandbox key");
+            Vec::new()
+        },
+    }
+}
+
+/// Revoke the keys `superseded_sandbox_key_ids` named, and drop the v1 cache entry.
 ///
 /// Revoked rather than merely orphaned: the raw v1 key was handed to every
 /// sandbox that ever ran, so leaving the row live would leave a read+write
@@ -119,18 +187,16 @@ pub(super) async fn ensure_sandbox_api_key(store: &auth::CredentialStore) -> Opt
 /// throughout - a failure here must not stop the narrower key being minted,
 /// because a startup that gives up leaves the old key in place, which is the
 /// state this is here to end.
-async fn retire_old_sandbox_api_keys(store: &auth::CredentialStore) {
-    match store.list_api_keys().await {
-        Ok(keys) => {
-            for entry in keys.iter().filter(|e| e.label == SANDBOX_API_KEY_LABEL) {
-                if let Err(e) = store.revoke_api_key(entry.id).await {
-                    warn!(error = %e, id = entry.id, "failed to revoke old sandbox API key");
-                } else {
-                    info!(id = entry.id, "revoked pre-rotation sandbox-ctl API key");
-                }
-            }
-        },
-        Err(e) => warn!(error = %e, "failed to list API keys while rotating the sandbox key"),
+///
+/// Only ever called by the startup that won the cache slot, and only with ids
+/// it observed before minting.
+async fn retire_superseded_sandbox_keys(store: &auth::CredentialStore, superseded: &[i64]) {
+    for &id in superseded {
+        if let Err(e) = store.revoke_api_key(id).await {
+            warn!(error = %e, id, "failed to revoke old sandbox API key");
+        } else {
+            info!(id, "revoked pre-rotation sandbox-ctl API key");
+        }
     }
 
     match store.list_env_vars().await {
@@ -230,6 +296,71 @@ mod tests {
                 .count(),
             1,
             "re-minting on every startup would leak a key per boot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_startup_never_revokes_a_key_minted_after_its_own_snapshot() {
+        // The concurrent-rotation bug, reduced to its ordering. Two gateways
+        // share a credential database and both miss the V2 cache. Gateway B
+        // looks at the store, then gateway A completes a whole rotation, then
+        // B gets around to retiring. The old pass retired by label at that
+        // later moment, so it revoked A's brand-new key and left A injecting a
+        // dead credential into every sandbox it started.
+        let store = memory_store().await;
+
+        // B looks first: nothing carries the label yet.
+        let b_snapshot = superseded_sandbox_key_ids(&store).await;
+        assert!(
+            b_snapshot.is_empty(),
+            "nothing exists yet, so B has nothing of its own to retire"
+        );
+
+        // A mints, publishes and hands its key to its sandboxes.
+        let a_key = ensure_sandbox_api_key(&store).await.expect("gateway A key");
+
+        // B now retires, with the list it captured before A existed.
+        retire_superseded_sandbox_keys(&store, &b_snapshot).await;
+
+        assert!(
+            sandbox_key_scopes(&store, &a_key).await.is_some(),
+            "the key A handed to its sandboxes must still be valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_losing_startup_adopts_the_published_key_instead_of_its_own() {
+        // Both startups mint, only one can publish. The loser must hand its
+        // sandboxes the published key - two live keys under one cache entry
+        // means whichever gateway retires next revokes a credential that is in
+        // use somewhere.
+        let store = memory_store().await;
+
+        let (first, second) = tokio::join!(
+            ensure_sandbox_api_key(&store),
+            ensure_sandbox_api_key(&store),
+        );
+        let first = first.expect("first startup key");
+        let second = second.expect("second startup key");
+
+        assert_eq!(
+            first, second,
+            "both startups must end up handing out the same key"
+        );
+        assert!(
+            sandbox_key_scopes(&store, &first).await.is_some(),
+            "and that key must not have been revoked by the other startup"
+        );
+        assert_eq!(
+            store
+                .list_api_keys()
+                .await
+                .expect("list")
+                .iter()
+                .filter(|entry| entry.label == SANDBOX_API_KEY_LABEL)
+                .count(),
+            1,
+            "a key minted and then lost must be revoked, not left live as a spare"
         );
     }
 

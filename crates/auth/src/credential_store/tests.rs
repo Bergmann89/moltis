@@ -361,6 +361,57 @@ async fn test_credential_store_env_vars() {
 }
 
 #[tokio::test]
+async fn test_set_env_var_if_absent_picks_one_winner_and_keeps_its_value() {
+    // The primitive the sandbox key rotation uses to decide which of two
+    // startups owns the cache slot. A read-then-write cannot make that call:
+    // both would read nothing and both would write, so the second silently
+    // overwrites a value the first already handed out.
+    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    let store = CredentialStore::new(pool).await.unwrap();
+
+    assert!(
+        store
+            .set_env_var_if_absent("CLAIMED", "first")
+            .await
+            .unwrap(),
+        "the first writer must be told it created the entry"
+    );
+    assert!(
+        !store
+            .set_env_var_if_absent("CLAIMED", "second")
+            .await
+            .unwrap(),
+        "a later writer must be told it lost"
+    );
+
+    let values = store.get_all_env_values().await.unwrap();
+    let claimed = values.iter().find(|(k, _)| k == "CLAIMED").unwrap();
+    assert_eq!(
+        claimed.1, "first",
+        "the loser must not overwrite the winner's value"
+    );
+    assert_eq!(
+        store
+            .list_env_vars()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|v| v.key == "CLAIMED")
+            .count(),
+        1,
+        "and it must not add a second row either"
+    );
+
+    // An upsert through the normal path still wins, so this is a claim, not a lock.
+    store.set_env_var("CLAIMED", "replaced").await.unwrap();
+    let values = store.get_all_env_values().await.unwrap();
+    assert_eq!(
+        values.iter().find(|(k, _)| k == "CLAIMED").unwrap().1,
+        "replaced"
+    );
+}
+
+#[tokio::test]
 async fn test_credential_store_ssh_keys_and_targets() {
     let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
     let store = CredentialStore::new(pool).await.unwrap();
