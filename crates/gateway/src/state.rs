@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "metrics")]
@@ -191,13 +191,13 @@ impl ConnectedClient {
     }
 
     /// Get the elapsed duration since last activity.
-    pub fn last_activity_elapsed(&self) -> std::time::Duration {
+    pub fn last_activity_elapsed(&self) -> Duration {
         use std::sync::atomic::Ordering;
         static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let start = *PROCESS_START.get_or_init(Instant::now);
         let stored_ms = self.last_activity_ms.load(Ordering::Relaxed);
         let total_elapsed = start.elapsed().as_millis() as u64;
-        std::time::Duration::from_millis(total_elapsed.saturating_sub(stored_ms))
+        Duration::from_millis(total_elapsed.saturating_sub(stored_ms))
     }
 }
 
@@ -816,7 +816,7 @@ impl GatewayState {
     /// Capped at 1000 entries; stale entries (>5 min) are evicted opportunistically.
     pub async fn set_run_error(&self, run_id: &str, error: String) {
         const MAX_RUN_ERRORS: usize = 1000;
-        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        const TTL: Duration = Duration::from_secs(300);
         let mut inner = self.inner.write().await;
         let now = Instant::now();
         // Opportunistic eviction of stale entries
@@ -978,7 +978,7 @@ impl GatewayState {
         conn_id: &str,
         method: &str,
         params: serde_json::Value,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<serde_json::Value, moltis_protocol::ErrorShape> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let req_frame = moltis_protocol::RequestFrame {
@@ -1083,6 +1083,20 @@ impl GatewayState {
         self.node_count
             .store(inner.nodes.count(), Ordering::Relaxed);
         removed
+    }
+
+    /// Remove nodes that stopped reporting and reconcile `node_count`.
+    ///
+    /// Returns the reaped sessions so the caller can announce them.  Like the
+    /// register/unregister pair, the counter is recomputed while the inner
+    /// write guard is still held - a reaper that clears the maps and leaves the
+    /// counter alone is the same corruption by another route.
+    pub async fn reap_stale_nodes(&self, max_idle: Duration) -> Vec<NodeSession> {
+        let mut inner = self.inner.write().await;
+        let reaped = inner.nodes.reap_stale(max_idle);
+        self.node_count
+            .store(inner.nodes.count(), Ordering::Relaxed);
+        reaped
     }
 
     /// Close a client: remove from registry and unregister from nodes.
@@ -1411,6 +1425,42 @@ mod tests {
         assert_node_count_matches_registry(&state, "final unregister").await;
         // What `has_connected_nodes()` reads through GatewayNodeExecProvider.
         assert_eq!(state.node_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reaping_a_stale_node_reconciles_node_count_and_announces_it() {
+        let state = test_state();
+
+        let (client, mut rx) = mock_client("conn-ui");
+        state.register_client(client).await;
+
+        let mut node = node_session("node-1", "conn-1");
+        node.connected_at = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("the test clock must reach back that far");
+        node.last_telemetry = Instant::now().checked_sub(Duration::from_secs(300));
+        state.register_node(node).await;
+        assert_eq!(state.node_count.load(Ordering::Relaxed), 1);
+
+        let reaped = crate::nodes::reap_stale_nodes_once(&state, Duration::from_secs(70)).await;
+        assert_eq!(reaped, 1);
+
+        let registry_count = state.inner.read().await.nodes.count();
+        assert_eq!(registry_count, 0);
+        assert_eq!(
+            state.node_count.load(Ordering::Relaxed),
+            registry_count,
+            "the reaper must reconcile node_count with the registry"
+        );
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the reaper must announce the node it removed")
+            .expect("the client channel must stay open");
+        let frame: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(frame["event"], "presence");
+        assert_eq!(frame["payload"]["type"], "node.disconnected");
+        assert_eq!(frame["payload"]["nodeId"], "node-1");
     }
 
     // ── Subscription tests ──────────────────────────────────────────────
