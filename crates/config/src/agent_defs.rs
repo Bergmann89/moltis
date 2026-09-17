@@ -394,10 +394,21 @@ pub fn merge_agent_defs(
 /// permission error or a mid-write truncation says nothing about what it asked
 /// for. Warning and moving on would have been the `off` path again, reached by
 /// a different error type.
+///
+/// `force` is set as well as `mode`, and it is the half that actually holds.
+/// `mode` loses to a per-session override by design - that precedence is the
+/// long-standing contract - so a session that had already been toggled to
+/// `sandboxEnabled: false` went straight back to the host the moment the
+/// definition broke, which is the exact path this function exists to close.
+/// Only `force` outranks that override. The cost is that the toggle is refused
+/// while the file is broken; fixing the file restores the agent's real policy,
+/// and an agent whose declared policy is currently unknown is not one to hand
+/// an off switch for.
 fn fail_closed_preset() -> AgentPreset {
     AgentPreset {
         sandbox: PresetSandboxPolicy {
             mode: Some(PresetSandboxMode::All),
+            force: true,
             ..Default::default()
         },
         ..Default::default()
@@ -903,6 +914,11 @@ Search thoroughly.
             Some(PresetSandboxMode::All),
             "and it must fail closed, not inherit whatever the global mode is"
         );
+        assert!(
+            preset.sandbox.forces_sandbox(),
+            "`mode` alone loses to a per-session override, so a session already \
+             toggled off would reach the host anyway - only `force` holds"
+        );
     }
 
     #[cfg(unix)]
@@ -933,6 +949,10 @@ Search thoroughly.
             preset.sandbox.mode,
             Some(PresetSandboxMode::All),
             "and it must fail closed, the same way a parse error does"
+        );
+        assert!(
+            preset.sandbox.forces_sandbox(),
+            "and it must pin the sandbox on, the same way a parse error does"
         );
     }
 
