@@ -370,7 +370,10 @@ async fn test_set_env_var_if_absent_picks_one_winner_and_keeps_its_value() {
     let store = CredentialStore::new(pool).await.unwrap();
 
     assert!(
-        store.set_env_var_if_absent("CLAIMED", "first").await.unwrap(),
+        store
+            .set_env_var_if_absent("CLAIMED", "first")
+            .await
+            .unwrap(),
         "the first writer must be told it created the entry"
     );
     assert!(
