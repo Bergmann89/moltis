@@ -41,17 +41,16 @@ impl CredentialStore {
         let _ = key;
 
         #[cfg(feature = "vault")]
-        if self.is_vault_encryption_enabled() {
-            if let Some(ref vault) = self.vault
-                && vault.is_unsealed().await
-            {
-                let aad = format!("env:{key}");
-                let enc = vault
-                    .encrypt_string(value, &aad)
-                    .await
-                    .map_err(|e| Error::Crypto(e.to_string()))?;
-                return Ok((enc, 1_i64));
-            }
+        if self.is_vault_encryption_enabled()
+            && let Some(ref vault) = self.vault
+            && vault.is_unsealed().await
+        {
+            let aad = format!("env:{key}");
+            let enc = vault
+                .encrypt_string(value, &aad)
+                .await
+                .map_err(|e| Error::Crypto(e.to_string()))?;
+            return Ok((enc, 1_i64));
         }
 
         Ok((value.to_owned(), 0_i64))
