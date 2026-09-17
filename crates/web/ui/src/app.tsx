@@ -27,6 +27,7 @@ import { initPWA } from "./pwa";
 import { initInstallBanner } from "./pwa-install";
 import { mount, navigate, registerPage, sessionPath } from "./router";
 import { routes } from "./routes";
+import * as _sandbox from "./sandbox";
 import { updateSandboxImageUI, updateSandboxUI } from "./sandbox";
 import * as _sessions from "./sessions";
 import {
@@ -60,6 +61,7 @@ window.__moltis_modules = {
 	helpers: _helpers,
 	events: _events,
 	"chat-ui": _chatUi,
+	sandbox: _sandbox,
 	sessions: _sessions,
 	gon,
 	"code-highlight": _codeHighlight,
