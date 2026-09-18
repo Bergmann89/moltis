@@ -44,7 +44,7 @@ pub struct ExecCompletionEvent {
 pub type ExecCompletionFn = Arc<dyn Fn(ExecCompletionEvent) + Send + Sync>;
 
 use crate::{
-    approval::{ApprovalAction, ApprovalDecision, ApprovalManager},
+    approval::{ApprovalAction, ApprovalDecision, ApprovalManager, ApprovalMode},
     sandbox::{ManagedFilesMount, NoSandbox, Sandbox, SandboxId, SandboxRouter},
 };
 
@@ -361,11 +361,19 @@ impl ExecTool {
             .is_some_and(|p| p.has_connected_nodes())
     }
 
-    async fn require_approval(&self, command: &str, session_key: Option<&str>) -> Result<()> {
+    /// Gate a command on approval, under the acting agent's mode override
+    /// when it declared one.
+    async fn require_approval(
+        &self,
+        command: &str,
+        session_key: Option<&str>,
+        mode: Option<ApprovalMode>,
+    ) -> Result<()> {
         let Some(manager) = &self.approval_manager else {
             return Ok(());
         };
-        if manager.check_command(command).await? != ApprovalAction::NeedsApproval {
+        let action = manager.check_command_with_mode(command, mode).await?;
+        if action != ApprovalAction::NeedsApproval {
             return Ok(());
         }
 
@@ -493,6 +501,13 @@ impl AgentTool for ExecTool {
             .map(String::from);
         let clear_default_node =
             pinned_node.is_none() && params.get("node").is_some_and(serde_json::Value::is_null);
+        // The acting agent's approval posture, also reserved metadata. An
+        // unparseable value is ignored rather than guessed at, so a typo in a
+        // preset cannot silently loosen the global posture.
+        let approval_mode = params
+            .get("_exec_approval")
+            .and_then(|v| v.as_str())
+            .and_then(ApprovalMode::parse);
         // Determine the effective node reference, distinguishing model-supplied
         // values from the admin-configured default.  When no nodes are connected:
         // - Model-hallucinated values are silently dropped (fall through to local).
@@ -540,7 +555,8 @@ impl AgentTool for ExecTool {
             let cwd = params.get("working_dir").and_then(|v| v.as_str());
             let session_key = params.get("_session_key").and_then(|v| v.as_str());
 
-            self.require_approval(command, session_key).await?;
+            self.require_approval(command, session_key, approval_mode.clone())
+                .await?;
 
             info!(
                 command_bytes = command.len(),
@@ -695,7 +711,8 @@ impl AgentTool for ExecTool {
         // skip approval gating.
         let needs_approval = !is_sandboxed || !has_container_backend;
         if needs_approval {
-            self.require_approval(command, session_key).await?;
+            self.require_approval(command, session_key, approval_mode)
+                .await?;
         }
 
         let secret_env = if let Some(ref provider) = self.env_provider {

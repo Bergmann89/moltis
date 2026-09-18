@@ -1295,6 +1295,35 @@ async fn pinned_node_with_nothing_connected_fails_closed() {
 }
 
 #[tokio::test]
+async fn exec_approval_override_from_the_tool_context_reaches_the_manager() {
+    // Global posture is `always`, which prompts for everything. The agent's
+    // `off` override must reach `check_command_with_mode` and let the command
+    // through without an approver.
+    // `ApprovalManager` has private fields, so build it the way the
+    // neighbouring tests do rather than with struct update syntax.
+    let mut manager = ApprovalManager::default();
+    manager.mode = ApprovalMode::Always;
+    // Keep a regression fast: without the override this would wait out the
+    // approval timeout with no approver on the other end.
+    manager.timeout = Duration::from_millis(50);
+    let manager = Arc::new(manager);
+    let broadcaster: Arc<dyn ApprovalBroadcaster> = Arc::new(TestBroadcaster::new());
+    let (resolved, tool) = pin_recorder();
+    let tool = tool.with_approval(manager, broadcaster);
+
+    tool.execute(serde_json::json!({
+        "command": "echo pinned",
+        "_node": "felix-workstation",
+        "_exec_approval": "off",
+    }))
+    .await
+    .unwrap();
+
+    let resolved = resolved.lock().unwrap().clone();
+    assert_eq!(resolved, vec!["felix-workstation".to_string()]);
+}
+
+#[tokio::test]
 async fn test_remote_exec_checks_approval_before_forwarding() {
     let called = Arc::new(AtomicBool::new(false));
     let mut manager = ApprovalManager::default();

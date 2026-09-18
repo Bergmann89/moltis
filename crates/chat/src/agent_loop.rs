@@ -497,6 +497,7 @@ pub(crate) fn explicit_shell_exec_params(
     conn_id: Option<&str>,
     working_dir: Option<&str>,
     node: Option<&str>,
+    exec_approval: Option<&str>,
 ) -> Value {
     let mut params = serde_json::json!({
         "command": command,
@@ -513,6 +514,9 @@ pub(crate) fn explicit_shell_exec_params(
     }
     if let Some(node) = node {
         params["_node"] = serde_json::json!(node);
+    }
+    if let Some(exec_approval) = exec_approval {
+        params["_exec_approval"] = serde_json::json!(exec_approval);
     }
     params
 }
@@ -531,6 +535,7 @@ pub(crate) async fn run_explicit_shell_command(
     client_seq: Option<u64>,
     working_dir: Option<String>,
     node: Option<String>,
+    exec_approval: Option<String>,
 ) -> AssistantTurnOutput {
     let started = Instant::now();
     let tool_call_id = format!("sh_{}", uuid::Uuid::new_v4().simple());
@@ -561,6 +566,7 @@ pub(crate) async fn run_explicit_shell_command(
         conn_id.as_deref(),
         working_dir.as_deref(),
         node.as_deref(),
+        exec_approval.as_deref(),
     );
 
     let exec_tool = {
@@ -818,19 +824,23 @@ mod tests {
             None,
             Some("/srv/work"),
             Some("felix-workstation"),
+            Some("off"),
         );
 
         assert_eq!(params["command"], "uname -a");
         assert_eq!(params["_session_key"], "main:felix");
         assert_eq!(params["_working_dir"], "/srv/work");
         assert_eq!(params["_node"], "felix-workstation");
+        assert_eq!(params["_exec_approval"], "off");
     }
 
     #[test]
     fn explicit_shell_params_omit_node_when_the_agent_is_unpinned() {
-        let params = explicit_shell_exec_params("uname -a", "main:tommy", None, None, None, None);
+        let params =
+            explicit_shell_exec_params("uname -a", "main:tommy", None, None, None, None, None);
 
         assert!(params.get("_node").is_none());
+        assert!(params.get("_exec_approval").is_none());
     }
 
     struct RecordingStreamOutbound {

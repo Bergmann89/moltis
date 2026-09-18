@@ -414,15 +414,17 @@ pub(crate) fn build_tool_context(
     {
         tool_context["_working_dir"] = serde_json::json!(working_dir);
     }
-    // The acting agent's node pin. Reserved metadata, like `_working_dir`: the
-    // model cannot set it, and `exec` lets it win over any `node` the model
-    // supplies.
-    if let Some(node) = config
-        .agents
-        .get_preset(agent_id)
-        .and_then(|preset| preset.node.as_deref())
-    {
-        tool_context["_node"] = serde_json::json!(node);
+    // The acting agent's reserved metadata: its node pin and its approval
+    // posture. Like `_working_dir`, the model cannot set these - `exec` lets
+    // `_node` win over any `node` the model supplies, and `_exec_approval`
+    // replaces the global approval mode for this agent's commands only.
+    if let Some(preset) = config.agents.get_preset(agent_id) {
+        if let Some(node) = preset.node.as_deref() {
+            tool_context["_node"] = serde_json::json!(node);
+        }
+        if let Some(exec_approval) = preset.exec_approval.as_deref() {
+            tool_context["_exec_approval"] = serde_json::json!(exec_approval);
+        }
     }
     tool_context
 }
@@ -786,13 +788,13 @@ mod tests {
 
     fn config_with_node_pin(agent_id: &str, node: Option<&str>) -> moltis_config::MoltisConfig {
         let mut config = moltis_config::MoltisConfig::default();
-        config.agents.presets.insert(
-            agent_id.to_string(),
-            moltis_config::AgentPreset {
+        config
+            .agents
+            .presets
+            .insert(agent_id.to_string(), moltis_config::AgentPreset {
                 node: node.map(str::to_string),
                 ..Default::default()
-            },
-        );
+            });
         config
     }
 
@@ -811,13 +813,13 @@ mod tests {
     #[test]
     fn tool_context_carries_the_acting_agents_exec_approval() {
         let mut config = moltis_config::MoltisConfig::default();
-        config.agents.presets.insert(
-            "felix".to_string(),
-            moltis_config::AgentPreset {
+        config
+            .agents
+            .presets
+            .insert("felix".to_string(), moltis_config::AgentPreset {
                 exec_approval: Some("off".into()),
                 ..Default::default()
-            },
-        );
+            });
 
         let context = build_tool_context("main:felix", None, None, None, "felix", &config);
         assert_eq!(

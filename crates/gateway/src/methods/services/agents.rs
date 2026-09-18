@@ -937,6 +937,9 @@ fn preset_from_rpc_params(
     if params.get("node").is_some() {
         preset.node = optional_string(params, "node");
     }
+    if params.get("exec_approval").is_some() {
+        preset.exec_approval = optional_string(params, "exec_approval");
+    }
     if params.get("system_prompt_suffix").is_some() || params.get("soul").is_some() {
         preset.system_prompt_suffix = optional_string(params, "system_prompt_suffix")
             .or_else(|| optional_string(params, "soul"));
