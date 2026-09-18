@@ -521,6 +521,22 @@ impl ApprovalManager {
     /// Decide whether a command needs approval.
     /// Returns Ok(()) if the command can proceed, Err if denied.
     pub async fn check_command(&self, command: &str) -> Result<ApprovalAction> {
+        self.check_command_with_mode(command, None).await
+    }
+
+    /// Decide whether a command needs approval under a per-agent mode override.
+    ///
+    /// `mode` replaces the manager's own mode everywhere it is consulted -
+    /// including both safety floors, so an `Off` override denies a dangerous
+    /// command exactly as a global `Off` does. It never turns a hard deny into
+    /// a prompt, and never into an allow. `None` behaves exactly like
+    /// [`Self::check_command`].
+    pub async fn check_command_with_mode(
+        &self,
+        command: &str,
+        mode: Option<ApprovalMode>,
+    ) -> Result<ApprovalAction> {
+        let mode = mode.unwrap_or_else(|| self.mode.clone());
         // Safety floor: dangerous patterns are blocked unless explicitly
         // allowlisted. In OnMiss/Always mode we escalate to NeedsApproval so a
         // human can gate. In Off mode there is no human approver to wait on,
@@ -528,7 +544,7 @@ impl ApprovalManager {
         // on `NeedsApproval` forever in headless deployments (moltis-org/moltis#654).
         if let Some(desc) = check_dangerous(command) {
             if !matches_allowlist(command, &self.allowlist) {
-                if self.mode == ApprovalMode::Off {
+                if mode == ApprovalMode::Off {
                     warn!(
                         command,
                         pattern = %desc,
@@ -551,7 +567,7 @@ impl ApprovalManager {
         // the regex layer above (moltis-org/moltis#814).
         if !command.trim().is_empty() && extract_first_bin(command).is_none() {
             if !matches_allowlist(command, &self.allowlist) {
-                if self.mode == ApprovalMode::Off {
+                if mode == ApprovalMode::Off {
                     warn!(
                         command,
                         "dangerous env-var prefix denied in approval_mode=off",
@@ -580,7 +596,7 @@ impl ApprovalManager {
             SecurityLevel::Allowlist => {},
         }
 
-        match self.mode {
+        match mode {
             ApprovalMode::Off => {
                 // With an empty allowlist, Off mode is unrestricted (preserves
                 // historical behavior for deployments that never configured a list).
@@ -884,6 +900,60 @@ mod tests {
         let mgr = ApprovalManager::default();
         let action = mgr.check_command("echo hi").await.unwrap();
         assert_eq!(action, ApprovalAction::Proceed);
+    }
+
+    #[tokio::test]
+    async fn an_off_override_allows_what_a_global_on_miss_would_prompt_for() {
+        let manager = ApprovalManager::default();
+        assert_eq!(manager.mode, ApprovalMode::OnMiss);
+
+        // Not a safe bin and not allowlisted, so on-miss prompts for it.
+        let action = manager.check_command("cargo build").await.unwrap();
+        assert_eq!(action, ApprovalAction::NeedsApproval);
+
+        let action = manager
+            .check_command_with_mode("cargo build", Some(ApprovalMode::Off))
+            .await
+            .unwrap();
+        assert_eq!(action, ApprovalAction::Proceed);
+    }
+
+    #[tokio::test]
+    async fn check_command_without_an_override_behaves_exactly_as_before() {
+        let manager = ApprovalManager::default();
+
+        for command in ["echo hi", "cargo build", "rm -rf /"] {
+            let plain = manager.check_command(command).await;
+            let explicit = manager.check_command_with_mode(command, None).await;
+            match (plain, explicit) {
+                (Ok(plain), Ok(explicit)) => assert_eq!(plain, explicit),
+                (Err(plain), Err(explicit)) => {
+                    assert_eq!(plain.to_string(), explicit.to_string());
+                },
+                _ => panic!("an absent override must not change the outcome for {command}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_off_override_still_hard_denies_a_dangerous_command() {
+        let manager = ApprovalManager::default();
+
+        // Under the global on-miss the safety floor escalates to a prompt.
+        let action = manager.check_command("rm -rf /").await.unwrap();
+        assert_eq!(action, ApprovalAction::NeedsApproval);
+
+        // Under an Off override it must deny, exactly as a global Off does:
+        // there is no human to prompt, so a prompt would hang forever and an
+        // allow would run it.
+        let error = manager
+            .check_command_with_mode("rm -rf /", Some(ApprovalMode::Off))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("approval_mode=off"),
+            "an Off override must hard-deny, got: {error}"
+        );
     }
 
     #[tokio::test]

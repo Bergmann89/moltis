@@ -1008,6 +1008,8 @@ pub(crate) async fn run_with_tools(
         accept_language.as_deref(),
         conn_id.as_deref(),
         prompt_runtime_context,
+        agent_id,
+        &persona.config,
     );
     tool_context["_trace_correlation_key"] = serde_json::json!(run_id);
     if let Some(controls) = tool_controls {

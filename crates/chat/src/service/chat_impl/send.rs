@@ -376,6 +376,18 @@ impl LiveChatService {
                 .await;
             let working_dir = working_dir.map(|directory| directory.display().to_string());
 
+            // The `/sh` branch returns long before `resolve_prompt_agent_id`
+            // runs at the bottom of `send`, and the session-entry load further
+            // down sits behind a `session_metadata.upsert`, so the acting agent
+            // is read here rather than hoisted. Without it a pinned agent's
+            // `/sh` runs on the gateway host while its model-issued execs go to
+            // the node.
+            let sh_session_entry = self.session_metadata.get(&session_key).await;
+            let sh_agent_id = resolve_prompt_agent_id(sh_session_entry.as_ref());
+            let sh_preset = self.config.agents.get_preset(&sh_agent_id);
+            let sh_node = sh_preset.and_then(|preset| preset.node.clone());
+            let sh_exec_approval = sh_preset.and_then(|preset| preset.exec_approval.clone());
+
             let (start_run, run_registered) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
                 if run_registered.await.is_err() {
@@ -403,6 +415,8 @@ impl LiveChatService {
                     conn_id_for_tool,
                     client_seq,
                     working_dir,
+                    sh_node,
+                    sh_exec_approval,
                 )
                 .await;
 

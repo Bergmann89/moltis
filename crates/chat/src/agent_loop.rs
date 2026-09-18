@@ -485,6 +485,42 @@ pub(crate) async fn commit_terminal_and_finish_channel_stream(
     dispatcher.completed_target_keys().await
 }
 
+/// Build the `exec` params for an explicit `/sh` command.
+///
+/// `/sh` bypasses the model and the tool-call path entirely, so every piece of
+/// reserved metadata that `build_tool_context` would have attached has to be
+/// put in by hand here instead.
+pub(crate) fn explicit_shell_exec_params(
+    command: &str,
+    session_key: &str,
+    accept_language: Option<&str>,
+    conn_id: Option<&str>,
+    working_dir: Option<&str>,
+    node: Option<&str>,
+    exec_approval: Option<&str>,
+) -> Value {
+    let mut params = serde_json::json!({
+        "command": command,
+        "_session_key": session_key,
+    });
+    if let Some(lang) = accept_language {
+        params["_accept_language"] = serde_json::json!(lang);
+    }
+    if let Some(cid) = conn_id {
+        params["_conn_id"] = serde_json::json!(cid);
+    }
+    if let Some(directory) = working_dir {
+        params["_working_dir"] = serde_json::json!(directory);
+    }
+    if let Some(node) = node {
+        params["_node"] = serde_json::json!(node);
+    }
+    if let Some(exec_approval) = exec_approval {
+        params["_exec_approval"] = serde_json::json!(exec_approval);
+    }
+    params
+}
+
 pub(crate) async fn run_explicit_shell_command(
     state: &Arc<dyn ChatRuntime>,
     run_id: &str,
@@ -498,6 +534,8 @@ pub(crate) async fn run_explicit_shell_command(
     conn_id: Option<String>,
     client_seq: Option<u64>,
     working_dir: Option<String>,
+    node: Option<String>,
+    exec_approval: Option<String>,
 ) -> AssistantTurnOutput {
     let started = Instant::now();
     let tool_call_id = format!("sh_{}", uuid::Uuid::new_v4().simple());
@@ -521,19 +559,15 @@ pub(crate) async fn run_explicit_shell_command(
     )
     .await;
 
-    let mut exec_params = serde_json::json!({
-        "command": command,
-        "_session_key": session_key,
-    });
-    if let Some(lang) = accept_language.as_deref() {
-        exec_params["_accept_language"] = serde_json::json!(lang);
-    }
-    if let Some(cid) = conn_id.as_deref() {
-        exec_params["_conn_id"] = serde_json::json!(cid);
-    }
-    if let Some(directory) = working_dir {
-        exec_params["_working_dir"] = serde_json::json!(directory);
-    }
+    let exec_params = explicit_shell_exec_params(
+        command,
+        session_key,
+        accept_language.as_deref(),
+        conn_id.as_deref(),
+        working_dir.as_deref(),
+        node.as_deref(),
+        exec_approval.as_deref(),
+    );
 
     let exec_tool = {
         let registry = tool_registry.read().await;
@@ -777,6 +811,37 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    /// `/sh` is the bypass: it never goes through `build_tool_context`, so a
+    /// pinned agent whose `_node` is not injected here runs its shell commands
+    /// on the gateway host while every model-issued exec goes to the node.
+    #[test]
+    fn explicit_shell_params_carry_the_agents_node_pin() {
+        let params = explicit_shell_exec_params(
+            "uname -a",
+            "main:felix",
+            None,
+            None,
+            Some("/srv/work"),
+            Some("felix-workstation"),
+            Some("off"),
+        );
+
+        assert_eq!(params["command"], "uname -a");
+        assert_eq!(params["_session_key"], "main:felix");
+        assert_eq!(params["_working_dir"], "/srv/work");
+        assert_eq!(params["_node"], "felix-workstation");
+        assert_eq!(params["_exec_approval"], "off");
+    }
+
+    #[test]
+    fn explicit_shell_params_omit_node_when_the_agent_is_unpinned() {
+        let params =
+            explicit_shell_exec_params("uname -a", "main:tommy", None, None, None, None, None);
+
+        assert!(params.get("_node").is_none());
+        assert!(params.get("_exec_approval").is_none());
+    }
 
     struct RecordingStreamOutbound {
         streams_final_replies: bool,

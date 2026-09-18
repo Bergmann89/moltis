@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "metrics")]
@@ -81,7 +81,7 @@ use {moltis_channels::ChannelReplyTarget, moltis_sessions::session_events::Sessi
 use crate::{
     auth::{CredentialStore, ResolvedAuth},
     broadcast::Broadcaster,
-    nodes::NodeRegistry,
+    nodes::{NodeRegistry, NodeSession},
     pairing::{PairingState, PairingStore},
     services::GatewayServices,
 };
@@ -191,13 +191,13 @@ impl ConnectedClient {
     }
 
     /// Get the elapsed duration since last activity.
-    pub fn last_activity_elapsed(&self) -> std::time::Duration {
+    pub fn last_activity_elapsed(&self) -> Duration {
         use std::sync::atomic::Ordering;
         static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let start = *PROCESS_START.get_or_init(Instant::now);
         let stored_ms = self.last_activity_ms.load(Ordering::Relaxed);
         let total_elapsed = start.elapsed().as_millis() as u64;
-        std::time::Duration::from_millis(total_elapsed.saturating_sub(stored_ms))
+        Duration::from_millis(total_elapsed.saturating_sub(stored_ms))
     }
 }
 
@@ -520,7 +520,14 @@ pub struct GatewayState {
     /// Live count of connected nodes.  Shared with `ExecTool` via the
     /// `GatewayNodeExecProvider` so `parameters_schema()` can check it
     /// without awaiting the inner lock.
-    pub node_count: Arc<AtomicUsize>,
+    ///
+    /// Deliberately `pub(crate)`: it mirrors [`NodeRegistry::count`] and is
+    /// only ever written by [`GatewayState::register_node`],
+    /// [`GatewayState::unregister_node_by_conn`] and
+    /// [`GatewayState::disconnect_all_clients`], which recompute it from the
+    /// registry under the same guard.  Other crates read it through
+    /// `GatewayNodeExecProvider` rather than doing their own arithmetic on it.
+    pub(crate) node_count: Arc<AtomicUsize>,
     /// Count of configured SSH targets exposed as remote execution options.
     pub ssh_target_count: Arc<AtomicUsize>,
 
@@ -809,7 +816,7 @@ impl GatewayState {
     /// Capped at 1000 entries; stale entries (>5 min) are evicted opportunistically.
     pub async fn set_run_error(&self, run_id: &str, error: String) {
         const MAX_RUN_ERRORS: usize = 1000;
-        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        const TTL: Duration = Duration::from_secs(300);
         let mut inner = self.inner.write().await;
         let now = Instant::now();
         // Opportunistic eviction of stale entries
@@ -971,7 +978,7 @@ impl GatewayState {
         conn_id: &str,
         method: &str,
         params: serde_json::Value,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<serde_json::Value, moltis_protocol::ErrorShape> {
         let request_id = uuid::Uuid::new_v4().to_string();
         let req_frame = moltis_protocol::RequestFrame {
@@ -1053,10 +1060,49 @@ impl GatewayState {
         }
     }
 
+    /// Register a node session and reconcile the `node_count` mirror.
+    ///
+    /// `node_count` is a separate atomic that `has_connected_nodes()` reads
+    /// without taking the inner lock, so it is recomputed from the registry
+    /// **while the inner write guard is still held**.  Storing after the guard
+    /// drops would let two concurrent mutations land out of order and leave the
+    /// counter disagreeing with the map until the next mutation.
+    pub async fn register_node(&self, session: NodeSession) {
+        let mut inner = self.inner.write().await;
+        inner.nodes.register(session);
+        self.node_count
+            .store(inner.nodes.count(), Ordering::Relaxed);
+    }
+
+    /// Unregister the node session owned by `conn_id` and reconcile
+    /// `node_count`.  Returns the removed session, or `None` when `conn_id` is
+    /// a stale connection whose node has already reconnected elsewhere.
+    pub async fn unregister_node_by_conn(&self, conn_id: &str) -> Option<NodeSession> {
+        let mut inner = self.inner.write().await;
+        let removed = inner.nodes.unregister_by_conn(conn_id);
+        self.node_count
+            .store(inner.nodes.count(), Ordering::Relaxed);
+        removed
+    }
+
+    /// Remove nodes that stopped reporting and reconcile `node_count`.
+    ///
+    /// Returns the reaped sessions so the caller can announce them.  Like the
+    /// register/unregister pair, the counter is recomputed while the inner
+    /// write guard is still held - a reaper that clears the maps and leaves the
+    /// counter alone is the same corruption by another route.
+    pub async fn reap_stale_nodes(&self, max_idle: Duration) -> Vec<NodeSession> {
+        let mut inner = self.inner.write().await;
+        let reaped = inner.nodes.reap_stale(max_idle);
+        self.node_count
+            .store(inner.nodes.count(), Ordering::Relaxed);
+        reaped
+    }
+
     /// Close a client: remove from registry and unregister from nodes.
     pub async fn close_client(&self, conn_id: &str) -> Option<ConnectedClient> {
-        // Unregister the node first (inner lock).
-        self.inner.write().await.nodes.unregister_by_conn(conn_id);
+        // Unregister the node first (inner lock); this reconciles node_count.
+        self.unregister_node_by_conn(conn_id).await;
 
         // Then remove the client from the client registry (separate lock).
         let (removed, count) = self.client_registry.write().await.remove_client(conn_id);
@@ -1263,19 +1309,11 @@ mod tests {
         assert_eq!(state.client_count().await, 0);
     }
 
-    #[tokio::test]
-    async fn disconnect_all_clients_resets_node_count() {
-        use {
-            crate::nodes::NodeSession,
-            std::{collections::HashMap, time::Instant},
-        };
-
-        let state = test_state();
-
-        // Register a node so the counter goes up.
-        let node = NodeSession {
-            node_id: "node-1".into(),
-            conn_id: "conn-1".into(),
+    /// Build a node session for the node-registry and counter tests.
+    fn node_session(node_id: &str, conn_id: &str) -> NodeSession {
+        NodeSession {
+            node_id: node_id.into(),
+            conn_id: conn_id.into(),
             display_name: None,
             platform: "macos".into(),
             version: "0.1.0".into(),
@@ -1296,8 +1334,20 @@ mod tests {
             disk_available: None,
             runtimes: vec![],
             providers: vec![],
-        };
-        state.inner.write().await.nodes.register(node);
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_all_clients_resets_node_count() {
+        let state = test_state();
+
+        // Register a node so the counter goes up.
+        state
+            .inner
+            .write()
+            .await
+            .nodes
+            .register(node_session("node-1", "conn-1"));
         state.node_count.fetch_add(1, Ordering::Relaxed);
 
         assert_eq!(state.node_count.load(Ordering::Relaxed), 1);
@@ -1306,6 +1356,111 @@ mod tests {
 
         // node_count must be reset to 0 so has_connected_nodes() returns false.
         assert_eq!(state.node_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn close_client_keeps_node_count_in_step_with_the_registry() {
+        let state = test_state();
+
+        // Registered the way the WS handler registers a node: the map and the
+        // atomic are bumped as two separate steps.
+        state
+            .inner
+            .write()
+            .await
+            .nodes
+            .register(node_session("node-1", "conn-1"));
+        state.node_count.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(state.node_count.load(Ordering::Relaxed), 1);
+
+        state.close_client("conn-1").await;
+
+        let registry_count = state.inner.read().await.nodes.count();
+        assert_eq!(registry_count, 0);
+        assert_eq!(
+            state.node_count.load(Ordering::Relaxed),
+            registry_count,
+            "close_client must leave node_count equal to the registry's count"
+        );
+    }
+
+    /// The counter is a mirror of the registry, so it must agree with it after
+    /// every mutation, not just at rest.
+    async fn assert_node_count_matches_registry(state: &Arc<GatewayState>, label: &str) {
+        let registry_count = state.inner.read().await.nodes.count();
+        assert_eq!(
+            state.node_count.load(Ordering::Relaxed),
+            registry_count,
+            "node_count must equal the registry count after {label}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_count_tracks_the_registry_across_reconnect_cycles() {
+        let state = test_state();
+
+        for cycle in 0..3 {
+            let conn = format!("conn-{cycle}");
+            state.register_node(node_session("node-1", &conn)).await;
+            assert_node_count_matches_registry(&state, "register").await;
+            assert_eq!(state.node_count.load(Ordering::Relaxed), 1);
+
+            // The previous cycle's connection dying afterwards is the stale
+            // unregister: it must touch neither the live session nor the counter.
+            if cycle > 0 {
+                let stale = format!("conn-{}", cycle - 1);
+                assert!(
+                    state.unregister_node_by_conn(&stale).await.is_none(),
+                    "a stale conn must not report a removal it did not perform"
+                );
+                assert_node_count_matches_registry(&state, "stale unregister").await;
+                assert_eq!(state.node_count.load(Ordering::Relaxed), 1);
+            }
+        }
+
+        assert!(
+            state.unregister_node_by_conn("conn-2").await.is_some(),
+            "the live conn must remove the session it owns"
+        );
+        assert_node_count_matches_registry(&state, "final unregister").await;
+        // What `has_connected_nodes()` reads through GatewayNodeExecProvider.
+        assert_eq!(state.node_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn reaping_a_stale_node_reconciles_node_count_and_announces_it() {
+        let state = test_state();
+
+        let (client, mut rx) = mock_client("conn-ui");
+        state.register_client(client).await;
+
+        let mut node = node_session("node-1", "conn-1");
+        node.connected_at = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("the test clock must reach back that far");
+        node.last_telemetry = Instant::now().checked_sub(Duration::from_secs(300));
+        state.register_node(node).await;
+        assert_eq!(state.node_count.load(Ordering::Relaxed), 1);
+
+        let reaped = crate::nodes::reap_stale_nodes_once(&state, Duration::from_secs(70)).await;
+        assert_eq!(reaped, 1);
+
+        let registry_count = state.inner.read().await.nodes.count();
+        assert_eq!(registry_count, 0);
+        assert_eq!(
+            state.node_count.load(Ordering::Relaxed),
+            registry_count,
+            "the reaper must reconcile node_count with the registry"
+        );
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the reaper must announce the node it removed")
+            .expect("the client channel must stay open");
+        let frame: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(frame["event"], "presence");
+        assert_eq!(frame["payload"]["type"], "node.disconnected");
+        assert_eq!(frame["payload"]["nodeId"], "node-1");
     }
 
     // ── Subscription tests ──────────────────────────────────────────────

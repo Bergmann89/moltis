@@ -393,6 +393,8 @@ pub(crate) fn build_tool_context(
     accept_language: Option<&str>,
     conn_id: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
+    agent_id: &str,
+    config: &moltis_config::MoltisConfig,
 ) -> Value {
     let mut tool_context = serde_json::json!({
         "_session_key": session_key,
@@ -411,6 +413,18 @@ pub(crate) fn build_tool_context(
     if let Some(working_dir) = runtime_context.and_then(|context| context.host.working_dir.as_ref())
     {
         tool_context["_working_dir"] = serde_json::json!(working_dir);
+    }
+    // The acting agent's reserved metadata: its node pin and its approval
+    // posture. Like `_working_dir`, the model cannot set these - `exec` lets
+    // `_node` win over any `node` the model supplies, and `_exec_approval`
+    // replaces the global approval mode for this agent's commands only.
+    if let Some(preset) = config.agents.get_preset(agent_id) {
+        if let Some(node) = preset.node.as_deref() {
+            tool_context["_node"] = serde_json::json!(node);
+        }
+        if let Some(exec_approval) = preset.exec_approval.as_deref() {
+            tool_context["_exec_approval"] = serde_json::json!(exec_approval);
+        }
     }
     tool_context
 }
@@ -772,12 +786,78 @@ mod tests {
         assert_eq!(filtered[0].name, "web-search");
     }
 
+    fn config_with_node_pin(agent_id: &str, node: Option<&str>) -> moltis_config::MoltisConfig {
+        let mut config = moltis_config::MoltisConfig::default();
+        config
+            .agents
+            .presets
+            .insert(agent_id.to_string(), moltis_config::AgentPreset {
+                node: node.map(str::to_string),
+                ..Default::default()
+            });
+        config
+    }
+
+    #[test]
+    fn tool_context_carries_the_acting_agents_node_pin() {
+        let config = config_with_node_pin("felix", Some("felix-workstation"));
+
+        let context = build_tool_context("main:felix", None, None, None, "felix", &config);
+
+        assert_eq!(
+            context.get("_node").and_then(Value::as_str),
+            Some("felix-workstation")
+        );
+    }
+
+    #[test]
+    fn tool_context_carries_the_acting_agents_exec_approval() {
+        let mut config = moltis_config::MoltisConfig::default();
+        config
+            .agents
+            .presets
+            .insert("felix".to_string(), moltis_config::AgentPreset {
+                exec_approval: Some("off".into()),
+                ..Default::default()
+            });
+
+        let context = build_tool_context("main:felix", None, None, None, "felix", &config);
+        assert_eq!(
+            context.get("_exec_approval").and_then(Value::as_str),
+            Some("off")
+        );
+
+        // An agent with no preset must not inherit anyone else's posture.
+        let context = build_tool_context("main:walter", None, None, None, "walter", &config);
+        assert!(context.get("_exec_approval").is_none());
+    }
+
+    #[test]
+    fn tool_context_omits_node_when_the_agent_declares_none() {
+        let config = config_with_node_pin("tommy", None);
+
+        let context = build_tool_context("main:tommy", None, None, None, "tommy", &config);
+
+        assert!(context.get("_node").is_none());
+
+        // An agent with no preset at all must not inherit anyone else's pin.
+        let context = build_tool_context("main:walter", None, None, None, "walter", &config);
+        assert!(context.get("_node").is_none());
+    }
+
     #[test]
     fn working_directory_uses_reserved_tool_metadata() {
         let mut runtime = PromptRuntimeContext::default();
         runtime.host.working_dir = Some("/workspace/project".into());
 
-        let context = build_tool_context("acp:test", None, None, Some(&runtime));
+        let context = build_tool_context(
+            "acp:test",
+            None,
+            None,
+            Some(&runtime),
+            "main",
+            &moltis_config::MoltisConfig::default(),
+        );
 
         assert_eq!(
             context.get("_working_dir").and_then(Value::as_str),
@@ -794,7 +874,14 @@ mod tests {
         runtime.host.channel_chat_id = Some("-100123".into());
         runtime.host.channel_outbound_to = Some("-100123:42".into());
 
-        let context = build_tool_context("telegram:main:-100123:42", None, None, Some(&runtime));
+        let context = build_tool_context(
+            "telegram:main:-100123:42",
+            None,
+            None,
+            Some(&runtime),
+            "main",
+            &moltis_config::MoltisConfig::default(),
+        );
 
         assert_eq!(context["_channel"]["account_id"], "main");
         assert_eq!(context["_channel"]["chat_id"], "-100123");

@@ -47,6 +47,8 @@ struct AgentFrontmatter {
     run_as: Option<String>,
     skills_allow: Option<String>,
     skills_deny: Option<String>,
+    node: Option<String>,
+    exec_approval: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -88,6 +90,10 @@ struct AgentFrontmatterOut {
     skills_allow: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_deny: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exec_approval: Option<String>,
 }
 
 /// Parse a markdown agent definition file into a preset name and config.
@@ -144,6 +150,8 @@ pub fn parse_agent_md(content: &str) -> anyhow::Result<(String, AgentPreset)> {
             allow: fm.skills_allow.map(csv_list),
             deny: fm.skills_deny.map(csv_list),
         },
+        node: fm.node,
+        exec_approval: fm.exec_approval,
         ..Default::default()
     };
 
@@ -188,6 +196,8 @@ pub fn render_agent_md(name: &str, preset: &AgentPreset) -> anyhow::Result<Strin
             .deny
             .as_ref()
             .and_then(|values| non_empty_join(values)),
+        node: preset.node.clone(),
+        exec_approval: preset.exec_approval.clone(),
     };
     let frontmatter = serde_yaml::to_string(&fm)?;
     let body = preset.system_prompt_suffix.as_deref().unwrap_or_default();
@@ -452,6 +462,52 @@ fn load_defs_from_dir(dir: &Path, defs: &mut HashMap<String, AgentPreset>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The markdown sidecar is the only place a provisioned agent's preset
+    /// lives, and `AgentFrontmatter`/`AgentFrontmatterOut` are closed structs -
+    /// a field they do not carry is dropped on write and gone on the next
+    /// `refresh_agents_config`, leaving an agent that looks provisioned and
+    /// quietly executes on the gateway host.
+    #[test]
+    fn node_survives_a_frontmatter_round_trip() {
+        let preset = AgentPreset {
+            node: Some("felix-workstation".into()),
+            ..Default::default()
+        };
+
+        let rendered = render_agent_md("felix", &preset).unwrap();
+        assert!(
+            rendered.contains("node: felix-workstation"),
+            "the rendered frontmatter must carry the node pin, got:\n{rendered}"
+        );
+
+        let (name, parsed) = parse_agent_md(&rendered).unwrap();
+        assert_eq!(name, "felix");
+        assert_eq!(parsed.node.as_deref(), Some("felix-workstation"));
+    }
+
+    /// The same closed-struct trap as the node pin: an `exec_approval` that
+    /// does not survive the sidecar round trip leaves an agent that looks
+    /// provisioned while silently keeping the global approval posture.
+    #[test]
+    fn exec_approval_survives_a_frontmatter_round_trip() {
+        let preset = AgentPreset {
+            exec_approval: Some("off".into()),
+            ..Default::default()
+        };
+
+        let rendered = render_agent_md("felix", &preset).unwrap();
+        // serde_yaml quotes `off`, because YAML 1.1 would read a bare one as a
+        // boolean - so assert the key is emitted here and let the round trip
+        // below pin the value.
+        assert!(
+            rendered.contains("exec_approval:"),
+            "the rendered frontmatter must carry the approval mode, got:\n{rendered}"
+        );
+
+        let (_, parsed) = parse_agent_md(&rendered).unwrap();
+        assert_eq!(parsed.exec_approval.as_deref(), Some("off"));
+    }
 
     #[test]
     fn test_parse_agent_def_with_frontmatter() {

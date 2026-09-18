@@ -15,6 +15,6 @@ pub use {
     error::Error,
     identity::NodeIdentity,
     moltis_protocol::SYSTEM_EXEC_COMMAND,
-    runner::{NodeConfig, NodeHost},
+    runner::{DEFAULT_PONG_DEADLINE_SECS, NodeConfig, NodeHost},
     service::ServiceConfig,
 };

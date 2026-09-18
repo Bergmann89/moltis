@@ -1138,6 +1138,191 @@ impl NodeExecProvider for RecordingNodeProvider {
     }
 }
 
+/// Records every node reference the tool asked it to resolve.
+struct PinRecordingNodeProvider {
+    resolved: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl NodeExecProvider for PinRecordingNodeProvider {
+    async fn exec_on_node(
+        &self,
+        _node_id: &str,
+        _command: &str,
+        _timeout_secs: u64,
+        _cwd: Option<&str>,
+        _env: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<ExecResult> {
+        Ok(ExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        })
+    }
+
+    async fn resolve_node_id(&self, node_ref: &str) -> Option<String> {
+        self.resolved.lock().unwrap().push(node_ref.to_string());
+        Some(node_ref.to_string())
+    }
+
+    fn has_connected_nodes(&self) -> bool {
+        true
+    }
+
+    async fn default_node_ref(&self) -> Option<String> {
+        Some("some-other-node".into())
+    }
+}
+
+/// Nodes are connected, but not the one asked for.
+struct UnresolvableNodeProvider;
+
+#[async_trait]
+impl NodeExecProvider for UnresolvableNodeProvider {
+    async fn exec_on_node(
+        &self,
+        _node_id: &str,
+        _command: &str,
+        _timeout_secs: u64,
+        _cwd: Option<&str>,
+        _env: Option<&HashMap<String, String>>,
+    ) -> anyhow::Result<ExecResult> {
+        unreachable!("an unresolvable node must never be executed on");
+    }
+
+    async fn resolve_node_id(&self, _node_ref: &str) -> Option<String> {
+        None
+    }
+
+    fn has_connected_nodes(&self) -> bool {
+        true
+    }
+
+    async fn default_node_ref(&self) -> Option<String> {
+        None
+    }
+}
+
+fn pin_recorder() -> (Arc<std::sync::Mutex<Vec<String>>>, ExecTool) {
+    let resolved = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tool = ExecTool::default().with_node_provider(
+        Arc::new(PinRecordingNodeProvider {
+            resolved: Arc::clone(&resolved),
+        }),
+        None,
+    );
+    (resolved, tool)
+}
+
+#[tokio::test]
+async fn pinned_node_beats_a_model_supplied_node() {
+    let (resolved, tool) = pin_recorder();
+
+    tool.execute(serde_json::json!({
+        "command": "echo pinned",
+        "node": "somewhere-else",
+        "_node": "felix-workstation",
+    }))
+    .await
+    .unwrap();
+
+    let resolved = resolved.lock().unwrap().clone();
+    assert_eq!(resolved, vec!["felix-workstation".to_string()]);
+}
+
+#[tokio::test]
+async fn pinned_node_beats_a_model_supplied_null_node() {
+    let (resolved, tool) = pin_recorder();
+
+    // A bare `node: null` short-circuits the whole resolution today, which
+    // would let the model unpin itself and run on the gateway host.
+    tool.execute(serde_json::json!({
+        "command": "echo pinned",
+        "node": null,
+        "_node": "felix-workstation",
+    }))
+    .await
+    .unwrap();
+
+    let resolved = resolved.lock().unwrap().clone();
+    assert_eq!(resolved, vec!["felix-workstation".to_string()]);
+}
+
+#[tokio::test]
+async fn pinned_node_that_is_not_connected_errors_naming_the_node() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let tool = ExecTool {
+        working_dir: Some(temp_dir.path().to_path_buf()),
+        ..Default::default()
+    }
+    .with_node_provider(Arc::new(UnresolvableNodeProvider), None);
+
+    let error = tool
+        .execute(serde_json::json!({
+            "command": "echo local",
+            "_node": "felix-workstation",
+        }))
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("felix-workstation"),
+        "the error must name the pinned node, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn pinned_node_with_nothing_connected_fails_closed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let tool = ExecTool {
+        working_dir: Some(temp_dir.path().to_path_buf()),
+        ..Default::default()
+    }
+    .with_node_provider(Arc::new(DisconnectedNodeProvider), None);
+
+    let error = tool
+        .execute(serde_json::json!({
+            "command": "echo local",
+            "_node": "felix-workstation",
+        }))
+        .await
+        .expect_err("a pinned agent must not fall through to local execution");
+
+    assert!(
+        error.to_string().contains("felix-workstation"),
+        "the error must name the pinned node, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn exec_approval_override_from_the_tool_context_reaches_the_manager() {
+    // Global posture is `always`, which prompts for everything. The agent's
+    // `off` override must reach `check_command_with_mode` and let the command
+    // through without an approver.
+    // `ApprovalManager` has private fields, so build it the way the
+    // neighbouring tests do rather than with struct update syntax.
+    let mut manager = ApprovalManager::default();
+    manager.mode = ApprovalMode::Always;
+    // Keep a regression fast: without the override this would wait out the
+    // approval timeout with no approver on the other end.
+    manager.timeout = Duration::from_millis(50);
+    let manager = Arc::new(manager);
+    let broadcaster: Arc<dyn ApprovalBroadcaster> = Arc::new(TestBroadcaster::new());
+    let (resolved, tool) = pin_recorder();
+    let tool = tool.with_approval(manager, broadcaster);
+
+    tool.execute(serde_json::json!({
+        "command": "echo pinned",
+        "_node": "felix-workstation",
+        "_exec_approval": "off",
+    }))
+    .await
+    .unwrap();
+
+    let resolved = resolved.lock().unwrap().clone();
+    assert_eq!(resolved, vec!["felix-workstation".to_string()]);
+}
+
 #[tokio::test]
 async fn test_remote_exec_checks_approval_before_forwarding() {
     let called = Arc::new(AtomicBool::new(false));

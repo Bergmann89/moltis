@@ -1419,6 +1419,13 @@ pub(super) async fn complete_startup(
         });
     }
 
+    // Presence reaper: a node whose websocket loop never ends (a suspended
+    // notebook, a black-holed route) would otherwise stay Connected forever.
+    {
+        let reaper_state = Arc::clone(&state);
+        tokio::spawn(crate::nodes::run_node_reaper(reaper_state));
+    }
+
     let methods = Arc::new(MethodRegistry::new());
 
     #[cfg(feature = "push-notifications")]

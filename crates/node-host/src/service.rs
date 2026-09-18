@@ -9,6 +9,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use {
@@ -16,7 +17,11 @@ use {
     tracing::{debug, info},
 };
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    identity::NodeIdentity,
+    runner::{DEFAULT_PONG_DEADLINE_SECS, NodeConfig},
+};
 
 // ── Persisted connection config ────────────────────────────────────────────
 
@@ -37,10 +42,18 @@ pub struct ServiceConfig {
     /// Executable paths or names explicitly allowed for remote execution.
     #[serde(default)]
     pub allowed_programs: Vec<String>,
+    /// Seconds without any frame from the gateway before the node sends a
+    /// liveness Ping, and before an unanswered Ping ends the run loop.
+    #[serde(default = "default_pong_deadline")]
+    pub pong_deadline: u64,
 }
 
 fn default_timeout() -> u64 {
     300
+}
+
+fn default_pong_deadline() -> u64 {
+    DEFAULT_PONG_DEADLINE_SECS
 }
 
 impl ServiceConfig {
@@ -51,6 +64,33 @@ impl ServiceConfig {
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
         let config: Self = serde_json::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Build the runner config these saved parameters describe.
+    ///
+    /// `exec_timeout_override` is `moltis node run --timeout`; everything else
+    /// comes from `node.json`, so a value written by `moltis node add` reaches
+    /// the runner without the caller restating it.
+    pub fn to_node_config(
+        &self,
+        identity: Option<NodeIdentity>,
+        exec_timeout_override: Option<u64>,
+    ) -> NodeConfig {
+        NodeConfig {
+            gateway_url: self.gateway_url.clone(),
+            device_token: self.device_token.clone(),
+            identity,
+            node_id: self
+                .node_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            display_name: self.display_name.clone(),
+            exec_timeout: Duration::from_secs(exec_timeout_override.unwrap_or(self.timeout)),
+            working_dir: self.working_dir.clone(),
+            allowed_programs: self.allowed_programs.clone(),
+            pong_deadline: Duration::from_secs(self.pong_deadline),
+            ..Default::default()
+        }
     }
 
     /// Save to `<data_dir>/node.json`.
@@ -616,6 +656,7 @@ mod tests {
             working_dir: None,
             timeout: 300,
             allowed_programs: vec!["/usr/bin/git".into()],
+            pong_deadline: 45,
         };
 
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -627,6 +668,46 @@ mod tests {
         assert_eq!(loaded.display_name, config.display_name);
         assert_eq!(loaded.timeout, 300);
         assert_eq!(loaded.allowed_programs, ["/usr/bin/git"]);
+        assert_eq!(loaded.pong_deadline, 45);
+    }
+
+    /// A `node.json` written before the deadline existed still loads, and gets
+    /// the one default the whole tree shares.
+    #[test]
+    fn service_config_without_a_pong_deadline_takes_the_default() {
+        let json = r#"{
+            "gateway_url": "ws://gw:9090/ws",
+            "device_token": "",
+            "timeout": 300
+        }"#;
+
+        let loaded: ServiceConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(loaded.pong_deadline, DEFAULT_PONG_DEADLINE_SECS);
+    }
+
+    /// `moltis node add --pong-deadline` is only worth anything if the value
+    /// survives `node.json` and reaches the runner.
+    #[test]
+    fn to_node_config_carries_the_pong_deadline() {
+        let config = ServiceConfig {
+            gateway_url: "ws://gw:9090/ws".into(),
+            device_token: String::new(),
+            node_id: Some("node-1".into()),
+            display_name: None,
+            working_dir: None,
+            timeout: 300,
+            allowed_programs: Vec::new(),
+            pong_deadline: 5,
+        };
+
+        let node_config = config.to_node_config(None, None);
+
+        assert_eq!(
+            node_config.pong_deadline,
+            Duration::from_secs(5),
+            "the saved deadline must reach the runner instead of the built-in default"
+        );
     }
 
     #[test]
@@ -642,6 +723,7 @@ mod tests {
             working_dir: Some("/tmp".into()),
             timeout: 600,
             allowed_programs: Vec::new(),
+            pong_deadline: 20,
         };
 
         config.save(&dir).unwrap();
@@ -666,6 +748,7 @@ mod tests {
             working_dir: Some("/home/user".into()),
             timeout: 120,
             allowed_programs: Vec::new(),
+            pong_deadline: 20,
         };
         let log = PathBuf::from("/tmp/node.log");
 
@@ -698,6 +781,7 @@ mod tests {
             working_dir: None,
             timeout: 300,
             allowed_programs: Vec::new(),
+            pong_deadline: 20,
         };
         let log = PathBuf::from("/tmp/node.log");
 
@@ -719,6 +803,7 @@ mod tests {
             working_dir: Some("/srv".into()),
             timeout: 600,
             allowed_programs: Vec::new(),
+            pong_deadline: 20,
         };
         let log = PathBuf::from("/var/log/moltis/node.log");
 
@@ -752,6 +837,7 @@ mod tests {
             working_dir: None,
             timeout: 300,
             allowed_programs: Vec::new(),
+            pong_deadline: 20,
         };
         let log = PathBuf::from("/tmp/node.log");
 

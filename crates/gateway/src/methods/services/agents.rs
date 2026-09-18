@@ -932,6 +932,14 @@ fn preset_from_rpc_params(
     if params.get("model").is_some() {
         preset.model = optional_string(params, "model");
     }
+    // Absent preserves the stored pin; present-and-null (or an empty string)
+    // clears it - `optional_string` maps both to `None`.
+    if params.get("node").is_some() {
+        preset.node = optional_string(params, "node");
+    }
+    if params.get("exec_approval").is_some() {
+        preset.exec_approval = optional_string(params, "exec_approval");
+    }
     if params.get("system_prompt_suffix").is_some() || params.get("soul").is_some() {
         preset.system_prompt_suffix = optional_string(params, "system_prompt_suffix")
             .or_else(|| optional_string(params, "soul"));
@@ -1171,6 +1179,81 @@ async fn refresh_agents_config(ctx: &MethodContext) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_from_rpc_params_preserves_node_when_absent_and_clears_it_on_null() {
+        let base = moltis_config::AgentPreset {
+            node: Some("felix-workstation".into()),
+            ..Default::default()
+        };
+
+        // Absent preserves: every other field gates on presence, and an
+        // unrelated update must not silently unpin the agent.
+        let untouched = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "emoji": "🦊" }),
+            Some(&base),
+        )
+        .expect("an unrelated update must parse");
+        assert_eq!(untouched.node.as_deref(), Some("felix-workstation"));
+
+        let repinned = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "node": "jonas-workstation" }),
+            Some(&base),
+        )
+        .expect("a repin must parse");
+        assert_eq!(repinned.node.as_deref(), Some("jonas-workstation"));
+
+        // Present-and-null clears: this is what the rollback relies on.
+        let cleared = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "node": null }),
+            Some(&base),
+        )
+        .expect("an explicit clear must parse");
+        assert_eq!(cleared.node, None);
+    }
+
+    #[test]
+    fn preset_from_rpc_params_preserves_exec_approval_when_absent_and_clears_it_on_null() {
+        let base = moltis_config::AgentPreset {
+            exec_approval: Some("off".into()),
+            ..Default::default()
+        };
+
+        let untouched = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "emoji": "🦊" }),
+            Some(&base),
+        )
+        .expect("an unrelated update must parse");
+        assert_eq!(untouched.exec_approval.as_deref(), Some("off"));
+
+        let cleared = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "exec_approval": null }),
+            Some(&base),
+        )
+        .expect("an explicit clear must parse");
+        assert_eq!(cleared.exec_approval, None);
+    }
+
+    /// `agents.preset.get` hands the UI `toml::to_string_pretty(preset)`, so a
+    /// pin that does not survive that render is invisible to the operator.
+    #[test]
+    fn preset_toml_carries_the_node_pin() {
+        let preset = moltis_config::AgentPreset {
+            node: Some("felix-workstation".into()),
+            ..Default::default()
+        };
+
+        let rendered = toml::to_string_pretty(&preset).expect("a preset must render to TOML");
+        assert!(
+            rendered.contains("node = \"felix-workstation\""),
+            "the preset TOML must carry the node pin, got:\n{rendered}"
+        );
+    }
 
     #[test]
     fn preset_from_rpc_params_accepts_an_array_of_mount_triples() {
