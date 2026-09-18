@@ -482,14 +482,36 @@ impl AgentTool for ExecTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .map(String::from);
-        let clear_default_node = params.get("node").is_some_and(serde_json::Value::is_null);
+        // Reserved metadata: the acting agent's pin, set by the gateway and
+        // never by the model, so it wins over anything the model supplies -
+        // including a `node: null` that would otherwise clear the resolution
+        // before the precedence match below is even reached.
+        let pinned_node = params
+            .get("_node")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from);
+        let clear_default_node =
+            pinned_node.is_none() && params.get("node").is_some_and(serde_json::Value::is_null);
         // Determine the effective node reference, distinguishing model-supplied
         // values from the admin-configured default.  When no nodes are connected:
         // - Model-hallucinated values are silently dropped (fall through to local).
         // - A configured `default_node` produces a clear error so the admin knows
         //   the intended remote host is unavailable.
         let node_ref = if let Some(provider) = &self.node_provider {
-            if clear_default_node {
+            if let Some(pinned) = pinned_node {
+                // Fail closed. A pinned agent that quietly falls through to
+                // local execution when its node is away is the whole hazard
+                // the pin exists to remove.
+                if !provider.has_connected_nodes() {
+                    return Err(Error::message(format!(
+                        "node '{pinned}' is pinned for this agent but no nodes are currently \
+                         connected"
+                    ))
+                    .into());
+                }
+                Some(pinned)
+            } else if clear_default_node {
                 None
             } else if provider.has_connected_nodes() {
                 match model_node.or_else(|| self.default_node.clone()) {

@@ -47,6 +47,7 @@ struct AgentFrontmatter {
     run_as: Option<String>,
     skills_allow: Option<String>,
     skills_deny: Option<String>,
+    node: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -88,6 +89,8 @@ struct AgentFrontmatterOut {
     skills_allow: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skills_deny: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
 }
 
 /// Parse a markdown agent definition file into a preset name and config.
@@ -144,6 +147,7 @@ pub fn parse_agent_md(content: &str) -> anyhow::Result<(String, AgentPreset)> {
             allow: fm.skills_allow.map(csv_list),
             deny: fm.skills_deny.map(csv_list),
         },
+        node: fm.node,
         ..Default::default()
     };
 
@@ -188,6 +192,7 @@ pub fn render_agent_md(name: &str, preset: &AgentPreset) -> anyhow::Result<Strin
             .deny
             .as_ref()
             .and_then(|values| non_empty_join(values)),
+        node: preset.node.clone(),
     };
     let frontmatter = serde_yaml::to_string(&fm)?;
     let body = preset.system_prompt_suffix.as_deref().unwrap_or_default();
