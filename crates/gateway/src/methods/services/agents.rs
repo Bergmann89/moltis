@@ -1212,6 +1212,30 @@ mod tests {
         assert_eq!(cleared.node, None);
     }
 
+    #[test]
+    fn preset_from_rpc_params_preserves_exec_approval_when_absent_and_clears_it_on_null() {
+        let base = moltis_config::AgentPreset {
+            exec_approval: Some("off".into()),
+            ..Default::default()
+        };
+
+        let untouched = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "emoji": "🦊" }),
+            Some(&base),
+        )
+        .expect("an unrelated update must parse");
+        assert_eq!(untouched.exec_approval.as_deref(), Some("off"));
+
+        let cleared = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "exec_approval": null }),
+            Some(&base),
+        )
+        .expect("an explicit clear must parse");
+        assert_eq!(cleared.exec_approval, None);
+    }
+
     /// `agents.preset.get` hands the UI `toml::to_string_pretty(preset)`, so a
     /// pin that does not survive that render is invisible to the operator.
     #[test]

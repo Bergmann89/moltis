@@ -470,6 +470,29 @@ mod tests {
         assert_eq!(parsed.node.as_deref(), Some("felix-workstation"));
     }
 
+    /// The same closed-struct trap as the node pin: an `exec_approval` that
+    /// does not survive the sidecar round trip leaves an agent that looks
+    /// provisioned while silently keeping the global approval posture.
+    #[test]
+    fn exec_approval_survives_a_frontmatter_round_trip() {
+        let preset = AgentPreset {
+            exec_approval: Some("off".into()),
+            ..Default::default()
+        };
+
+        let rendered = render_agent_md("felix", &preset).unwrap();
+        // serde_yaml quotes `off`, because YAML 1.1 would read a bare one as a
+        // boolean - so assert the key is emitted here and let the round trip
+        // below pin the value.
+        assert!(
+            rendered.contains("exec_approval:"),
+            "the rendered frontmatter must carry the approval mode, got:\n{rendered}"
+        );
+
+        let (_, parsed) = parse_agent_md(&rendered).unwrap();
+        assert_eq!(parsed.exec_approval.as_deref(), Some("off"));
+    }
+
     #[test]
     fn test_parse_agent_def_with_frontmatter() {
         let content = r#"---

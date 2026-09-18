@@ -809,6 +809,28 @@ mod tests {
     }
 
     #[test]
+    fn tool_context_carries_the_acting_agents_exec_approval() {
+        let mut config = moltis_config::MoltisConfig::default();
+        config.agents.presets.insert(
+            "felix".to_string(),
+            moltis_config::AgentPreset {
+                exec_approval: Some("off".into()),
+                ..Default::default()
+            },
+        );
+
+        let context = build_tool_context("main:felix", None, None, None, "felix", &config);
+        assert_eq!(
+            context.get("_exec_approval").and_then(Value::as_str),
+            Some("off")
+        );
+
+        // An agent with no preset must not inherit anyone else's posture.
+        let context = build_tool_context("main:walter", None, None, None, "walter", &config);
+        assert!(context.get("_exec_approval").is_none());
+    }
+
+    #[test]
     fn tool_context_omits_node_when_the_agent_declares_none() {
         let config = config_with_node_pin("tommy", None);
 

@@ -1205,6 +1205,12 @@ pub struct AgentPreset {
     /// command the node cannot take fails rather than falling back to local
     /// execution.  Unset means the global `[tools.exec] node` default applies.
     pub node: Option<String>,
+    /// Per-agent `exec` approval mode: `off`, `on-miss` or `always`.
+    ///
+    /// Overrides the global `[tools.exec] approval_mode` for this agent only.
+    /// The dangerous-pattern floor still applies whatever this says - an `off`
+    /// override denies a dangerous command exactly as a global `off` does.
+    pub exec_approval: Option<String>,
     /// Per-agent skill access control.
     ///
     /// Controls which skills are visible to this agent. When `allow` is
