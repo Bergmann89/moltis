@@ -1198,6 +1198,13 @@ pub struct AgentPreset {
     /// Unset fields inherit the global config.
     #[serde(default, skip_serializing_if = "PresetSandboxPolicy::is_empty")]
     pub sandbox: PresetSandboxPolicy,
+    /// Pin this agent's command execution to a specific remote node.
+    ///
+    /// When set, every `exec` this agent runs is forwarded to that node - by
+    /// id or display name - instead of running on the gateway host, and a
+    /// command the node cannot take fails rather than falling back to local
+    /// execution.  Unset means the global `[tools.exec] node` default applies.
+    pub node: Option<String>,
     /// Per-agent skill access control.
     ///
     /// Controls which skills are visible to this agent. When `allow` is

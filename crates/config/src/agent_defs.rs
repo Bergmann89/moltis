@@ -442,6 +442,29 @@ fn load_defs_from_dir(dir: &Path, defs: &mut HashMap<String, AgentPreset>) {
 mod tests {
     use super::*;
 
+    /// The markdown sidecar is the only place a provisioned agent's preset
+    /// lives, and `AgentFrontmatter`/`AgentFrontmatterOut` are closed structs -
+    /// a field they do not carry is dropped on write and gone on the next
+    /// `refresh_agents_config`, leaving an agent that looks provisioned and
+    /// quietly executes on the gateway host.
+    #[test]
+    fn node_survives_a_frontmatter_round_trip() {
+        let preset = AgentPreset {
+            node: Some("felix-workstation".into()),
+            ..Default::default()
+        };
+
+        let rendered = render_agent_md("felix", &preset).unwrap();
+        assert!(
+            rendered.contains("node: felix-workstation"),
+            "the rendered frontmatter must carry the node pin, got:\n{rendered}"
+        );
+
+        let (name, parsed) = parse_agent_md(&rendered).unwrap();
+        assert_eq!(name, "felix");
+        assert_eq!(parsed.node.as_deref(), Some("felix-workstation"));
+    }
+
     #[test]
     fn test_parse_agent_def_with_frontmatter() {
         let content = r#"---

@@ -1173,6 +1173,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preset_from_rpc_params_preserves_node_when_absent_and_clears_it_on_null() {
+        let base = moltis_config::AgentPreset {
+            node: Some("felix-workstation".into()),
+            ..Default::default()
+        };
+
+        // Absent preserves: every other field gates on presence, and an
+        // unrelated update must not silently unpin the agent.
+        let untouched = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "emoji": "🦊" }),
+            Some(&base),
+        )
+        .expect("an unrelated update must parse");
+        assert_eq!(untouched.node.as_deref(), Some("felix-workstation"));
+
+        let repinned = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "node": "jonas-workstation" }),
+            Some(&base),
+        )
+        .expect("a repin must parse");
+        assert_eq!(repinned.node.as_deref(), Some("jonas-workstation"));
+
+        // Present-and-null clears: this is what the rollback relies on.
+        let cleared = preset_from_rpc_params(
+            "felix",
+            &serde_json::json!({ "id": "felix", "node": null }),
+            Some(&base),
+        )
+        .expect("an explicit clear must parse");
+        assert_eq!(cleared.node, None);
+    }
+
+    /// `agents.preset.get` hands the UI `toml::to_string_pretty(preset)`, so a
+    /// pin that does not survive that render is invisible to the operator.
+    #[test]
+    fn preset_toml_carries_the_node_pin() {
+        let preset = moltis_config::AgentPreset {
+            node: Some("felix-workstation".into()),
+            ..Default::default()
+        };
+
+        let rendered = toml::to_string_pretty(&preset).expect("a preset must render to TOML");
+        assert!(
+            rendered.contains("node = \"felix-workstation\""),
+            "the preset TOML must carry the node pin, got:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn preset_from_rpc_params_accepts_an_array_of_mount_triples() {
         let preset = preset_from_rpc_params(
             "walter",
